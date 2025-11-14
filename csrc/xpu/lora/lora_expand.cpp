@@ -52,7 +52,9 @@ class bgmv_expand_kernel {
   const uint32_t rank_;
   const uint32_t hidden_;
   const uint32_t output_hidden_;
+  const uint32_t num_loras_;
   const uint32_t slice_offset_;
+  const uint32_t slice_size_;
   const bool add_to_output_;
   WorkgroupLocal<accscalar_t> slm_;
   const uint32_t workitem_per_hidden_;
@@ -88,7 +90,9 @@ class bgmv_expand_kernel {
       const uint32_t rank,
       const uint32_t hidden,
       const uint32_t output_hidden,
+      const uint32_t num_loras,
       const uint32_t slice_offset,
+      const uint32_t slice_size,
       const bool add_to_output,
       WorkgroupLocal<accscalar_t> slm,
       const uint32_t workitem_per_hidden,
@@ -103,7 +107,9 @@ class bgmv_expand_kernel {
         rank_(rank),
         hidden_(hidden),
         output_hidden_(output_hidden),
+        num_loras_(num_loras),
         slice_offset_(slice_offset),
+        slice_size_(slice_size),
         add_to_output_(add_to_output),
         slm_(slm),
         workitem_per_hidden_(workitem_per_hidden),
@@ -129,15 +135,18 @@ class bgmv_expand_kernel {
         subgroup_id * hidden_per_subgroup_ + hidden_id_in_subgroup;
 
     if (hidden_id_in_subgroup >= hidden_per_subgroup_ ||
-        hidden_linear_id >= batch_size_ * hidden_) {
+        hidden_linear_id >= batch_size_ * slice_size_) {
       return;
     }
 
-    const uint32_t batch_id = hidden_linear_id / hidden_;
-    const uint32_t hidden_id = hidden_linear_id % hidden_;
+    const uint32_t batch_id = hidden_linear_id / slice_size_;
+    const uint32_t hidden_id = hidden_linear_id % slice_size_;
 
+    if (hidden_id >= slice_size_) {
+      return;
+    }
     const int64_t lora_idx = indices_[batch_id];
-    if (lora_idx < 0) return;
+    if (lora_idx < 0 || lora_idx >= num_loras_) return;
 
     const input_t* __restrict__ input_ptr =
         inputs_ + static_cast<size_t>(batch_id) * rank_;
@@ -152,20 +161,27 @@ class bgmv_expand_kernel {
       const input_t* __restrict__ input_base = input_ptr + offset;
       const output_t* __restrict__ weight_base = weight_ptr + offset;
       if constexpr (use_aligned_vector) {
-        const input_vec_t in_vec =
-            *reinterpret_cast<const input_vec_t*>(input_base);
-        const weight_vec_t wt_vec =
-            *reinterpret_cast<const weight_vec_t*>(weight_base);
+        if (offset + vec_size <= rank_) {
+          const input_vec_t in_vec =
+              *reinterpret_cast<const input_vec_t*>(input_base);
+          const weight_vec_t wt_vec =
+              *reinterpret_cast<const weight_vec_t*>(weight_base);
+
 #pragma unroll(vec_size)
-        for (uint32_t i = 0; i < vec_size; ++i) {
-          local_result += static_cast<accscalar_t>(in_vec[i]) *
-                          static_cast<accscalar_t>(wt_vec[i]);
+          for (uint32_t i = 0; i < vec_size; ++i) {
+            local_result += static_cast<accscalar_t>(in_vec[i]) *
+                            static_cast<accscalar_t>(wt_vec[i]);
+          }
+        } else {
+          // Handle remainder elements
+          for (uint32_t i = 0; i < vec_size && offset + i < rank_; ++i) {
+            local_result += static_cast<accscalar_t>(input_base[i]) *
+                            static_cast<accscalar_t>(weight_base[i]);
+          }
         }
       } else {
-#pragma unroll(vec_size)
-        for (uint32_t i = 0; i < vec_size; ++i) {
-          const uint32_t idx = offset + i;
-          if (idx >= rank_) break;
+        // Non-aligned vector load
+        for (uint32_t i = 0; i < vec_size && offset + i < rank_; ++i) {
           local_result += static_cast<accscalar_t>(input_base[i]) *
                           static_cast<accscalar_t>(weight_base[i]);
         }
@@ -176,7 +192,6 @@ class bgmv_expand_kernel {
     const uint32_t slm_base = item_id - vec_id;
     slm_[slm_base + vec_id] = local_result;
     sycl::group_barrier(sg);
-
     if (vec_id == 0) {
       accscalar_t result = 0;
 #pragma unroll
@@ -219,7 +234,9 @@ void launch_bgmv_expand_with_slice(
     const uint32_t rank,
     const uint32_t hidden,
     const uint32_t output_hidden,
+    const uint32_t num_loras,
     const uint32_t slice_offset,
+    const uint32_t slice_size,
     const bool add_to_output) {
   if (batch_size == 0 || rank == 0 || hidden == 0) return;
 
@@ -235,8 +252,9 @@ void launch_bgmv_expand_with_slice(
       std::min<uint32_t>((rank + vec_size - 1) / vec_size, subgroup_size);
 
   const uint32_t hidden_per_subgroup = subgroup_size / workitem_per_hidden;
+
   const uint32_t subgroup_num =
-      (batch_size * hidden + hidden_per_subgroup - 1) / hidden_per_subgroup;
+      (batch_size * slice_size + hidden_per_subgroup - 1) / hidden_per_subgroup;
 
   at::DeviceGuard device_guard(at::Device(at::kXPU, at::xpu::current_device()));
   auto& q = vllm::xpu::vllmGetQueue();
@@ -250,6 +268,24 @@ void launch_bgmv_expand_with_slice(
 
   sycl::range<1> local_range{workgroup_size};
   sycl::range<1> global_range{workgroup_num * workgroup_size};
+
+  // 添加调试信息
+  std::cout << "DEBUG launch_bgmv_expand_slice:" << std::endl;
+  std::cout << "  batch_size: " << batch_size << std::endl;
+  std::cout << "  rank: " << rank << std::endl;
+  std::cout << "  hidden_size: " << hidden << std::endl;
+  std::cout << "  output_hidden_size: " << output_hidden << std::endl;
+  std::cout << "  num_loras: " << num_loras << std::endl;
+  std::cout << "  slice_offset: " << slice_offset << std::endl;
+  std::cout << "  slice_size: " << slice_size << std::endl;
+  std::cout << "  add_to_output: " << add_to_output << std::endl;
+  std::cout << "  workitem_per_hidden: " << workitem_per_hidden << std::endl;
+  std::cout << "  hidden_per_subgroup: " << hidden_per_subgroup << std::endl;
+  std::cout << "  subgroup_num: " << subgroup_num << std::endl;
+  std::cout << "  workgroup_size: " << workgroup_size << std::endl;
+  std::cout << "  workgroup_num: " << workgroup_num << std::endl;
+  std::cout << "  use_aligned_vector: " << use_aligned_vector << std::endl;
+
   q.submit([&](sycl::handler& cgh) {
     WorkgroupLocal<vllm::xpu::acc_type<output_t>> slm(
         sycl::range(workgroup_size), cgh);
@@ -264,7 +300,9 @@ void launch_bgmv_expand_with_slice(
                   rank,
                   hidden,
                   output_hidden,
+                  num_loras,
                   slice_offset,
+                  slice_size,
                   add_to_output,
                   slm,
                   workitem_per_hidden,
@@ -283,7 +321,9 @@ void launch_bgmv_expand_with_slice(
                   rank,
                   hidden,
                   output_hidden,
+                  num_loras,
                   slice_offset,
+                  slice_size,
                   add_to_output,
                   slm,
                   workitem_per_hidden,
@@ -373,14 +413,35 @@ void bgmv_expand_slice(
     const torch::Tensor& weights,
     const torch::Tensor& indices,
     const int64_t slice_offset,
+    const int64_t slice_size,
     const bool add_to_output) {
   validate_lora_b_tensors(inputs, weights, outputs, indices);
   TORCH_CHECK(slice_offset >= 0, "slice_offset must be non-negative");
+  TORCH_CHECK(slice_size > 0, "slice_size must be positive");
+
+  // Handle 4D weights
+  at::Tensor lora_weights = weights;
+  if (lora_weights.dim() == 4) {
+    lora_weights = lora_weights.squeeze(1);
+  }
 
   uint32_t batch_size = inputs.size(0);
   uint32_t rank = inputs.size(1);
-  uint32_t hidden = weights.size(1);
+  uint32_t hidden = lora_weights.size(1);
   uint32_t output_hidden = outputs.size(1);
+  uint32_t num_loras = lora_weights.size(0);
+
+  TORCH_CHECK(
+      slice_offset + slice_size <= output_hidden,
+      "slice_offset + slice_size must be <= output_tensor.size(1)");
+
+  // Calculate actual slice size (respecting bounds)
+  uint32_t actual_slice_size = std::min<uint32_t>(
+      static_cast<uint32_t>(slice_size),
+      static_cast<uint32_t>(output_hidden - slice_offset));
+  actual_slice_size = std::min<uint32_t>(
+      static_cast<uint32_t>(actual_slice_size), static_cast<uint32_t>(hidden));
+
   VLLM_DISPATCH_HALF_TYPES(inputs.scalar_type(), "bgmv_expand_slice", [&]() {
     using input_t = scalar_t;
     switch (outputs.scalar_type()) {
@@ -388,30 +449,34 @@ void bgmv_expand_slice(
         launch_bgmv_expand_with_slice<at::Half, input_t>(
             outputs.data_ptr<at::Half>(),
             inputs.data_ptr<input_t>(),
-            weights.data_ptr<at::Half>(),
+            lora_weights.data_ptr<at::Half>(),
             indices.data_ptr<int64_t>(),
             batch_size,
             rank,
             hidden,
             output_hidden,
+            num_loras,
             slice_offset,
+            actual_slice_size,
             add_to_output);
         break;
       case at::ScalarType::BFloat16:
         launch_bgmv_expand_with_slice<at::BFloat16, input_t>(
             outputs.data_ptr<at::BFloat16>(),
             inputs.data_ptr<input_t>(),
-            weights.data_ptr<at::BFloat16>(),
+            lora_weights.data_ptr<at::BFloat16>(),
             indices.data_ptr<int64_t>(),
             batch_size,
             rank,
             hidden,
             output_hidden,
+            num_loras,
             slice_offset,
+            actual_slice_size,
             add_to_output);
         break;
       default:
-        TORCH_CHECK(false, "Unsupported output type: ", inputs.scalar_type());
+        TORCH_CHECK(false, "Unsupported output type: ", outputs.scalar_type());
     }
   });
 };
@@ -423,6 +488,27 @@ void bgmv_expand(
     const torch::Tensor& indices,
     bool add_to_output) {
   validate_lora_b_tensors(inputs, weights, outputs, indices);
+
+  // Handle 4D weights
+  at::Tensor lora_weights = weights;
+  if (weights.dim() == 4) {
+    lora_weights = lora_weights.squeeze(1);
+  }
+
+  uint32_t batch_size = inputs.size(0);
+  uint32_t output_hidden = outputs.size(1);
+  uint32_t hidden = lora_weights.size(1);
+
+  // Calculate common length (min of output dimensions)
+  uint32_t common_len = std::min(output_hidden, hidden);
+
+  // Use bgmv_expand_slice
   bgmv_expand_slice(
-      outputs, inputs, weights, indices, /*slice_offset=*/0, add_to_output);
-};
+      outputs,
+      inputs,
+      weights,
+      indices,
+      /*slice_offset=*/0,
+      /*slice_size=*/static_cast<int64_t>(common_len),
+      add_to_output);
+}
