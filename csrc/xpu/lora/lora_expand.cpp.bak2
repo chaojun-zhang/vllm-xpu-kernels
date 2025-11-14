@@ -28,8 +28,7 @@ namespace vllm::lora {
  *
  * Mathematical operation:
  *   For each sample b and slice dimension s:
- *     outputs[b, slice_offset + s] += Σ_r (inputs[b, r] * weights[indices[b],
- * s, r])
+ *     outputs[b, slice_offset + s] += Σ_r (inputs[b, r] * weights[indices[b], s, r])
  */
 template <typename output_t, typename input_t, uint32_t vec_size>
 class bgmv_expand_slice_kernel {
@@ -43,7 +42,6 @@ class bgmv_expand_slice_kernel {
   const uint32_t slice_offset_;
   const uint32_t slice_size_;
   const bool add_inputs_;
-  const uint32_t batch_size_;
 
  public:
   using acc_t = vllm::xpu::acc_type<input_t>;
@@ -70,8 +68,7 @@ class bgmv_expand_slice_kernel {
       const uint32_t rank,
       const uint32_t slice_offset,
       const uint32_t slice_size,
-      const bool add_inputs,
-      const uint32_t batch_size)
+      const bool add_inputs)
       : outputs_(outputs),
         inputs_(inputs),
         weights_(weights),
@@ -80,72 +77,84 @@ class bgmv_expand_slice_kernel {
         rank_(rank),
         slice_offset_(slice_offset),
         slice_size_(slice_size),
-        add_inputs_(add_inputs),
-        batch_size_(batch_size) {}
+        add_inputs_(add_inputs) {}
 
   void operator()(sycl::nd_item<1> item) const {
-    const uint32_t global_id = item.get_global_linear_id();
-    const uint32_t group_size = item.get_local_range(0);
+    // Thread indexing
+    const uint32_t local_id = item.get_local_linear_id();
     const uint32_t group_id = item.get_group_linear_id();
+    const uint32_t group_size = item.get_local_range(0);
 
-    // 计算总线程数
-    const uint32_t total_threads = group_size * item.get_group_range(0);
+    // Calculate batch and slice indices for current thread
+    // Workgroup mapping: group_id = batch_id * slice_size + slice_id
+    const uint32_t batch_id = group_id / slice_size_;  // Batch index [0, batch_size)
+    const uint32_t slice_id = group_id % slice_size_;  // Slice index [0, slice_size)
 
-    // 每个线程处理的元素数
-    const uint32_t elements_per_thread =
-        (batch_size_ * slice_size_ + total_threads - 1) / total_threads;
+    // Get LoRA index for current batch
+    const int64_t lora_idx = indices_[batch_id];
 
-    for (uint32_t i = 0; i < elements_per_thread; i++) {
-      const uint32_t element_idx = global_id + i * total_threads;
-      if (element_idx >= batch_size_ * slice_size_) break;
+    // Skip invalid LoRA indices
+    if (lora_idx < 0) return;
 
-      const uint32_t batch_id = element_idx / slice_size_;
-      const uint32_t slice_id = element_idx % slice_size_;
+    // Calculate data pointers
+    // inputs: [batch_size, rank] -> inputs[batch_id, :]
+    const input_t* input_base = inputs_ + batch_id * rank_;
 
-      const int64_t lora_idx = indices_[batch_id];
-      if (lora_idx < 0) continue;
+    // weights: [num_loras, slice_size, rank] -> weights[lora_idx, slice_id, :]
+    const input_t* weight_base = weights_ + lora_idx * slice_size_ * rank_ + slice_id * rank_;
 
-      // 数据指针
-      const input_t* input_base = inputs_ + batch_id * rank_;
-      const input_t* weight_base =
-          weights_ + lora_idx * slice_size_ * rank_ + slice_id * rank_;
+    // Initialize accumulator
+    acc_t local_sum = 0;
 
-      // 计算点积 - 使用向量化优化
-      acc_t sum = 0;
+    // Vectorized parallel processing along rank dimension
+    uint32_t offset = local_id * vec_size;
+    const uint32_t stride = group_size * vec_size;
 
-      // 向量化处理主要部分
-      const uint32_t full_vectors = rank_ / vec_size;
-      for (uint32_t j = 0; j < full_vectors; j++) {
-        const vec_t input_vec =
-            *reinterpret_cast<const vec_t*>(input_base + j * vec_size);
-        const vec_t weight_vec =
-            *reinterpret_cast<const vec_t*>(weight_base + j * vec_size);
+    // Main computation loop: dot product along rank dimension
+    while (offset < rank_) {
+      const uint32_t remaining = rank_ - offset;
+
+      if (remaining >= vec_size) {
+        // Full vector processing
+        const vec_t input_vec = *reinterpret_cast<const vec_t*>(input_base + offset);
+        const vec_t weight_vec = *reinterpret_cast<const vec_t*>(weight_base + offset);
 
 #pragma unroll
-        for (uint32_t k = 0; k < vec_size; k++) {
-          sum += static_cast<acc_t>(input_vec[k]) *
-                 static_cast<acc_t>(weight_vec[k]);
+        for (uint32_t i = 0; i < vec_size; i++) {
+          // input_vec[i] * weight_vec[i] corresponds to:
+          // inputs[batch_id, offset+i] * weights[lora_idx, slice_id, offset+i]
+          local_sum += static_cast<acc_t>(input_vec[i]) *
+                       static_cast<acc_t>(weight_vec[i]);
+        }
+      } else {
+        // Partial vector processing
+        for (uint32_t i = 0; i < remaining; i++) {
+          local_sum += static_cast<acc_t>(input_base[offset + i]) *
+                       static_cast<acc_t>(weight_base[offset + i]);
         }
       }
+      offset += stride;
+    }
 
-      // 处理剩余元素
-      const uint32_t remaining = rank_ % vec_size;
-      for (uint32_t j = 0; j < remaining; j++) {
-        const uint32_t offset = full_vectors * vec_size + j;
-        sum += static_cast<acc_t>(input_base[offset]) *
-               static_cast<acc_t>(weight_base[offset]);
-      }
+    // Workgroup reduction
+    const acc_t group_sum = sycl::reduce_over_group(
+        item.get_group(), local_sum, sycl::plus<acc_t>());
 
-      // 写入结果
+    // Only first thread in workgroup writes the result
+    if (local_id == 0) {
+      // Calculate output position: slice_offset + slice_id
       const uint32_t output_hidden_id = slice_offset_ + slice_id;
+
+      // Ensure we don't write beyond output tensor bounds
       if (output_hidden_id < hidden_) {
         const uint32_t output_idx = batch_id * hidden_ + output_hidden_id;
-        const output_t result = static_cast<output_t>(sum);
 
         if (add_inputs_) {
-          outputs_[output_idx] += result;
+          // Accumulate to existing output
+          outputs_[output_idx] += static_cast<output_t>(group_sum);
         } else {
-          outputs_[output_idx] = result;
+          // Replace existing output
+          outputs_[output_idx] = static_cast<output_t>(group_sum);
         }
       }
     }
@@ -154,25 +163,27 @@ class bgmv_expand_slice_kernel {
 
 }  // namespace vllm::lora
 
+
+
 // Vector size dispatch function
 template <typename Fn>
 void dispatch_vec_size(int vec_size, Fn&& fn) {
-  switch (vec_size) {
-    case 8:
-      fn(std::integral_constant<int, 8>{});
-      break;
-    case 4:
-      [[likely]] fn(std::integral_constant<int, 4>{});
-      break;
-    case 2:
-      fn(std::integral_constant<int, 2>{});
-      break;
-    case 1:
-      [[unlikely]] fn(std::integral_constant<int, 1>{});
-      break;
-    default:
-      [[unlikely]] TORCH_CHECK(false, "Unsupported vector size: ", vec_size);
-  }
+    switch (vec_size) {
+        case 8:
+            fn(std::integral_constant<int, 8>{});
+            break;
+        case 4:
+            [[likely]] fn(std::integral_constant<int, 4>{});
+            break;
+        case 2:
+            fn(std::integral_constant<int, 2>{});
+            break;
+        case 1:
+            [[unlikely]] fn(std::integral_constant<int, 1>{});
+            break;
+        default:
+            [[unlikely]] TORCH_CHECK(false, "Unsupported vector size: ", vec_size);
+    }
 }
 
 /**
@@ -201,7 +212,7 @@ void launch_bgmv_expand_slice(
     const uint32_t slice_offset,
     const uint32_t slice_size,
     const bool add_inputs) {
-  // 1. 计算最优向量大小
+  // 1. Calculate optimal vector size
   uint32_t vec_bytes = 16;
   const auto input_align = reinterpret_cast<uintptr_t>(inputs);
   const auto weight_align = reinterpret_cast<uintptr_t>(weights);
@@ -214,78 +225,48 @@ void launch_bgmv_expand_slice(
   }
   uint32_t vec_size = vec_bytes / sizeof(input_t);
 
-  // 2. 获取设备信息
+  // 2. Get device information
   at::Device curDevice = at::Device(at::kXPU, at::xpu::current_device());
   at::DeviceGuard device_guard(curDevice);
   auto& dpcpp_queue = vllm::xpu::vllmGetQueue();
   const auto dev_id = at::xpu::current_device();
   const uint32_t max_workgroup_size = vllm::xpu::getMaxWorkGroupSize(dev_id);
 
-  // 3. 针对大问题规模优化工作组配置
-  const uint32_t total_elements = batch_size * slice_size;
+  // 3. Calculate optimal workgroup size
+  uint32_t workgroup_size = 64;
+  const uint32_t elements_per_thread = (rank + vec_size - 1) / vec_size;
 
-  uint32_t workgroup_size, num_workgroups;
-
-  if (total_elements <= 8192) {
-    // 小规模问题
-    workgroup_size = 64;
-    num_workgroups = (total_elements + workgroup_size - 1) / workgroup_size;
-  } else if (total_elements <= 65536) {
-    // 中等规模问题
-    workgroup_size = 128;
-    num_workgroups = (total_elements + workgroup_size - 1) / workgroup_size;
-  } else if (total_elements <= 1048576) {  // 1M
-    // 较大规模问题
-    workgroup_size = 256;
-    num_workgroups = (total_elements + workgroup_size - 1) / workgroup_size;
-  } else {
-    // 超大规模问题 - 使用更多工作组
-    workgroup_size = 256;
-
-    // 限制每个线程处理的最大元素数
-    const uint32_t max_elements_per_thread = 16;
-    num_workgroups = (total_elements + max_elements_per_thread - 1) /
-                     max_elements_per_thread;
-
-    // 但也要确保工作组数量不会太大
-    num_workgroups = std::min(num_workgroups, 8192u);
+  while (workgroup_size < max_workgroup_size) {
+    const uint32_t next_size = workgroup_size * 2;
+    if (next_size > max_workgroup_size) break;
+    if (elements_per_thread < next_size / workgroup_size * 4) break;
+    workgroup_size = next_size;
   }
+  workgroup_size = sycl::min(workgroup_size, 256u);
 
-  // 确保不超过设备限制
-  workgroup_size = std::min(workgroup_size, max_workgroup_size);
-
-  // 4. 设置执行配置
+  // 4. Set execution configuration
+  // Total workgroups = batch_size * slice_size (one workgroup per (batch, slice) pair)
+  const uint32_t workgroup_num = batch_size * slice_size;
   const sycl::range<1> local_range{workgroup_size};
-  const sycl::range<1> global_range{num_workgroups * workgroup_size};
+  const sycl::range<1> global_range{workgroup_num * workgroup_size};
 
-  // 添加调试信息
-  // std::cout << "DEBUG launch_bgmv_expand_slice:" << std::endl;
-  // std::cout << "  batch_size: " << batch_size << std::endl;
-  // std::cout << "  rank: " << rank << std::endl;
-  // std::cout << "  hidden_size: " << hidden << std::endl;
-  // std::cout << "  slice_offset: " << slice_offset << std::endl;
-  // std::cout << "  slice_size: " << slice_size << std::endl;
-  // std::cout << "  total_elements: " << total_elements << std::endl;
-  // std::cout << "  workgroup_size: " << workgroup_size << std::endl;
-  // std::cout << "  workgroup_num: " << num_workgroups << std::endl;
-  // const uint32_t  elements_per_thread =(total_elements + num_workgroups *
-  // workgroup_size - 1) / (num_workgroups * workgroup_size); std::cout << "
-  // elements_per_thread: " << elements_per_thread << std::endl;
-  // 6. 提交内核
+    // 添加调试信息
+    std::cout << "DEBUG launch_bgmv_expand_slice:" << std::endl;
+    std::cout << "  batch_size: " << batch_size << std::endl;
+    std::cout << "  rank: " << rank << std::endl;
+    std::cout << "  hidden_size: " << hidden << std::endl;
+    std::cout << "  slice_offset: " << slice_offset << std::endl;
+    std::cout << "  slice_size: " << slice_size << std::endl;
+    std::cout << "  workgroup_size: " << workgroup_size << std::endl;
+    std::cout << "  workgroup_num: " << workgroup_num << std::endl;
+
+  // 5. Submit kernel execution
   dpcpp_queue.submit([&](sycl::handler& cgh) {
     dispatch_vec_size(vec_size, [&](auto vec_c) {
       constexpr int V = vec_c.value;
       vllm::lora::bgmv_expand_slice_kernel<output_t, input_t, V> kfn(
-          outputs,
-          inputs,
-          weights,
-          indices,
-          hidden,
-          rank,
-          slice_offset,
-          slice_size,
-          add_inputs,
-          batch_size);
+          outputs, inputs, weights, indices, hidden, rank,
+          slice_offset, slice_size, add_inputs);
       cgh.parallel_for(sycl::nd_range<1>(global_range, local_range), kfn);
     });
   });
@@ -302,18 +283,13 @@ void validate_lora_b_slice_tensors(
   TORCH_CHECK(inputs.is_xpu(), "inputs must be on XPU");
   TORCH_CHECK(lora_b_weights.is_xpu(), "lora_b_weights must be on XPU");
   TORCH_CHECK(output_tensor.is_xpu(), "output_tensor must be on XPU");
-  TORCH_CHECK(
-      lora_indices_tensor.is_xpu(), "lora_indices_tensor must be on XPU");
+  TORCH_CHECK(lora_indices_tensor.is_xpu(), "lora_indices_tensor must be on XPU");
 
   // Contiguous checks
   TORCH_CHECK(inputs.is_contiguous(), "inputs must be contiguous");
-  TORCH_CHECK(
-      lora_b_weights.is_contiguous(), "lora_b_weights must be contiguous");
-  TORCH_CHECK(
-      output_tensor.is_contiguous(), "output_tensor must be contiguous");
-  TORCH_CHECK(
-      lora_indices_tensor.is_contiguous(),
-      "lora_indices_tensor must be contiguous");
+  TORCH_CHECK(lora_b_weights.is_contiguous(), "lora_b_weights must be contiguous");
+  TORCH_CHECK(output_tensor.is_contiguous(), "output_tensor must be contiguous");
+  TORCH_CHECK(lora_indices_tensor.is_contiguous(), "lora_indices_tensor must be contiguous");
 
   // Dtype checks
   TORCH_CHECK(
@@ -321,14 +297,13 @@ void validate_lora_b_slice_tensors(
       "inputs dtype must match lora_b_weights dtype");
 
   TORCH_CHECK(
-      inputs.scalar_type() == at::kHalf ||
-          inputs.scalar_type() == at::kBFloat16,
+      inputs.scalar_type() == at::kHalf || inputs.scalar_type() == at::kBFloat16,
       "inputs must be float16 or bfloat16");
 
   TORCH_CHECK(
       output_tensor.scalar_type() == at::kHalf ||
-          output_tensor.scalar_type() == at::kBFloat16 ||
-          output_tensor.scalar_type() == at::kFloat,
+      output_tensor.scalar_type() == at::kBFloat16 ||
+      output_tensor.scalar_type() == at::kFloat,
       "output_tensor must be float16, bfloat16, or float32");
 
   TORCH_CHECK(
@@ -337,17 +312,12 @@ void validate_lora_b_slice_tensors(
 
   // Dimension checks
   TORCH_CHECK(inputs.dim() == 2, "inputs must be 2D [batch_size, rank]");
-  TORCH_CHECK(
-      output_tensor.dim() == 2,
-      "output_tensor must be 2D [batch_size, hidden_size]");
-  TORCH_CHECK(
-      lora_indices_tensor.dim() == 1,
-      "lora_indices_tensor must be 1D [batch_size]");
+  TORCH_CHECK(output_tensor.dim() == 2, "output_tensor must be 2D [batch_size, hidden_size]");
+  TORCH_CHECK(lora_indices_tensor.dim() == 1, "lora_indices_tensor must be 1D [batch_size]");
 
   at::Tensor lora_weights = lora_b_weights;
   if (lora_b_weights.dim() == 4) {  // shape: (lora_num,1,slice_size,rank)
-    TORCH_CHECK(
-        lora_b_weights.size(1) == 1, "lora_b_weights.size(1) must be 1");
+    TORCH_CHECK(lora_b_weights.size(1) == 1, "lora_b_weights.size(1) must be 1");
   } else {
     TORCH_CHECK(
         lora_b_weights.dim() == 3,
@@ -371,12 +341,8 @@ void validate_lora_b_slice_tensors(
   // Slice bounds check
   TORCH_CHECK(
       slice_offset + slice_size <= output_tensor.size(1),
-      "slice [",
-      slice_offset,
-      ":",
-      slice_offset + slice_size,
-      ") is out of bounds for output dimension ",
-      output_tensor.size(1));
+      "slice [", slice_offset, ":", slice_offset + slice_size,
+      ") is out of bounds for output dimension ", output_tensor.size(1));
 }
 
 /**
@@ -399,8 +365,8 @@ void bgmv_expand_slice(
     const int64_t slice_size,
     bool add_inputs) {
   // 1. Input validation
-  validate_lora_b_slice_tensors(
-      inputs, weights, outputs, indices, slice_offset, slice_size);
+  validate_lora_b_slice_tensors(inputs, weights, outputs, indices,
+                               slice_offset, slice_size);
 
   at::Tensor lora_weights = weights;
   if (lora_weights.dim() == 4) {  // shape: (lora_num,1,slice_size,rank)
@@ -413,55 +379,53 @@ void bgmv_expand_slice(
   uint32_t hidden = outputs.size(1);
 
   // 3. Dispatch based on INPUT type
-  VLLM_DISPATCH_FLOATING_TYPES(
-      inputs.scalar_type(), "bgmv_expand_slice", [&]() {
-        using input_t = scalar_t;
-        switch (outputs.scalar_type()) {
-          case at::ScalarType::Half:
-            launch_bgmv_expand_slice<at::Half, input_t>(
-                outputs.data_ptr<at::Half>(),
-                inputs.data_ptr<input_t>(),
-                lora_weights.data_ptr<input_t>(),
-                indices.data_ptr<int64_t>(),
-                batch_size,
-                hidden,
-                rank,
-                slice_offset,
-                slice_size,
-                add_inputs);
-            break;
-          case at::ScalarType::BFloat16:
-            launch_bgmv_expand_slice<at::BFloat16, input_t>(
-                outputs.data_ptr<at::BFloat16>(),
-                inputs.data_ptr<input_t>(),
-                lora_weights.data_ptr<input_t>(),
-                indices.data_ptr<int64_t>(),
-                batch_size,
-                hidden,
-                rank,
-                slice_offset,
-                slice_size,
-                add_inputs);
-            break;
-          case at::ScalarType::Float:
-            launch_bgmv_expand_slice<float, input_t>(
-                outputs.data_ptr<float>(),
-                inputs.data_ptr<input_t>(),
-                lora_weights.data_ptr<input_t>(),
-                indices.data_ptr<int64_t>(),
-                batch_size,
-                hidden,
-                rank,
-                slice_offset,
-                slice_size,
-                add_inputs);
-            break;
-          default:
-            TORCH_CHECK(
-                false, "Unsupported output type: ", outputs.scalar_type());
-            break;
-        }
-      });
+  VLLM_DISPATCH_FLOATING_TYPES(inputs.scalar_type(), "bgmv_expand_slice", [&]() {
+    using input_t = scalar_t;
+    switch (outputs.scalar_type()) {
+      case at::ScalarType::Half:
+        launch_bgmv_expand_slice<at::Half, input_t>(
+            outputs.data_ptr<at::Half>(),
+            inputs.data_ptr<input_t>(),
+            lora_weights.data_ptr<input_t>(),
+            indices.data_ptr<int64_t>(),
+            batch_size,
+            hidden,
+            rank,
+            slice_offset,
+            slice_size,
+            add_inputs);
+        break;
+      case at::ScalarType::BFloat16:
+        launch_bgmv_expand_slice<at::BFloat16, input_t>(
+            outputs.data_ptr<at::BFloat16>(),
+            inputs.data_ptr<input_t>(),
+            lora_weights.data_ptr<input_t>(),
+            indices.data_ptr<int64_t>(),
+            batch_size,
+            hidden,
+            rank,
+            slice_offset,
+            slice_size,
+            add_inputs);
+        break;
+      case at::ScalarType::Float:
+        launch_bgmv_expand_slice<float, input_t>(
+            outputs.data_ptr<float>(),
+            inputs.data_ptr<input_t>(),
+            lora_weights.data_ptr<input_t>(),
+            indices.data_ptr<int64_t>(),
+            batch_size,
+            hidden,
+            rank,
+            slice_offset,
+            slice_size,
+            add_inputs);
+        break;
+      default:
+        TORCH_CHECK(false, "Unsupported output type: ", outputs.scalar_type());
+        break;
+    }
+  });
 }
 
 /**
@@ -479,16 +443,17 @@ void bgmv_expand(
     const torch::Tensor& weights,
     const torch::Tensor& indices,
     bool add_inputs) {
-  // 2. Get dimension information
-  uint32_t hidden = outputs.size(1);
 
-  // 3. 直接调用 bgmv_expand_slice，设置 slice_offset=0, slice_size=hidden
-  bgmv_expand_slice(
-      outputs,
-      inputs,
-      weights,
-      indices,
-      0,       // slice_offset = 0
-      hidden,  // slice_size = 整个hidden维度
-      add_inputs);
+    // 2. Get dimension information
+    uint32_t hidden = outputs.size(1);
+
+    // 3. 直接调用 bgmv_expand_slice，设置 slice_offset=0, slice_size=hidden
+    bgmv_expand_slice(
+        outputs,
+        inputs,
+        weights,
+        indices,
+        0,           // slice_offset = 0
+        hidden,      // slice_size = 整个hidden维度
+        add_inputs);
 }
