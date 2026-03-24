@@ -10,9 +10,17 @@ namespace vllm {
 
 // Vectorization containers.
 //
-// vec_n_t<scalar_t, N>: aligned vector struct with float-promoted operators
-// mirroring _f16Vec semantics.  alignas(sizeof(scalar_t)*N) is valid because
-// both sizeof and N are compile-time constants.
+// vec_n_t<scalar_t, N>: aligned vector struct whose arithmetic operators
+// mirror the reference layernorm kernels in layernorm.cpp:
+//
+//   operator+=(vec)  — float-promoted add: val[i] = fp16(float(a)+float(b))
+//   operator*=(float)— float*scalar then fp16: val[i] = fp16(float(val)*scale)
+//   operator*=(vec)  — hardware scalar_t multiply: val[i] = val[i] * other.val[i]
+//   sum_squares()    — float-accumulated Σ float(val[i])²
+//
+// The mixed precision in *=(float) vs *=(vec) reflects the reference pass 2:
+//   dst = ((scalar_t)(float(x) * rsqrt)) * weight   ← step1: float*rsqrt→fp16
+//                                                    ← step2: fp16 * fp16 hw
 //
 // q8_n_t<quant_t, N>: aligned container for quantized (fp8/int8) values.
 
@@ -22,7 +30,15 @@ struct alignas(sizeof(scalar_t) * vec_size) vec_n_t {
                 "vec_size must be a positive power of 2");
   scalar_t val[vec_size];
 
-  // Float-promoted multiply by scalar (matches _f16Vec::operator*=(float))
+  vec_n_t& operator+=(const vec_n_t& other) {
+#pragma unroll
+    for (size_t i = 0; i < vec_size; ++i) {
+      val[i] = static_cast<scalar_t>(
+          static_cast<float>(val[i]) + static_cast<float>(other.val[i]));
+    }
+    return *this;
+  }
+
   vec_n_t& operator*=(const float scale) {
 #pragma unroll
     for (size_t i = 0; i < vec_size; ++i) {
@@ -31,7 +47,6 @@ struct alignas(sizeof(scalar_t) * vec_size) vec_n_t {
     return *this;
   }
 
-  // Float-promoted elementwise multiply (matches _f16Vec::operator*=(vec))
   vec_n_t& operator*=(const vec_n_t& other) {
 #pragma unroll
     for (size_t i = 0; i < vec_size; ++i) {

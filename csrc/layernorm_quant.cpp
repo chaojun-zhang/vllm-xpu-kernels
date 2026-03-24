@@ -25,7 +25,6 @@
 #include "ops.h"
 #include "quantization/fp8/quant_utils.h"
 #include "quantization/vectorization.h"
-#include "type_convert.h"
 #include "utils.h"
 
 namespace vllm {
@@ -263,7 +262,7 @@ class fused_add_rms_norm_static_fp8_quant_vec_kernel {
     static_assert(std::is_pod_v<_f16Vec<scalar_t, width>>);
     static_assert(sizeof(_f16Vec<scalar_t, width>) == sizeof(scalar_t) * width);
 
-    using vec_t = _f16Vec<scalar_t, width>;
+    using vec_t = vec_n_t<scalar_t, width>;
 
     float* s_variance_ptr =
         s_variance_.template get_multi_ptr<sycl::access::decorated::no>().get();
@@ -317,7 +316,7 @@ class fused_add_rms_norm_static_fp8_quant_vec_kernel {
       for (int i = 0; i < width; ++i) {
         out_[id * width + i] =
             fp8::scaled_fp8_conversion<true, fp8_type>(
-                static_cast<float>(temp.data[i]), scale_inv_);
+                static_cast<float>(temp.val[i]), scale_inv_);
       }
     }
   }
