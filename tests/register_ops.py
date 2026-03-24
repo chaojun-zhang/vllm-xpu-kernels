@@ -22,6 +22,20 @@ def fused_add_rms_norm(input: torch.Tensor, residual: torch.Tensor,
     torch.ops._C.fused_add_rms_norm(input, residual, weight, epsilon)
 
 
+def rms_norm_static_fp8_quant(out: torch.Tensor, input: torch.Tensor,
+                               weight: torch.Tensor, scale: torch.Tensor,
+                               epsilon: float) -> None:
+    torch.ops._C.rms_norm_static_fp8_quant(out, input, weight, scale, epsilon)
+
+
+def fused_add_rms_norm_static_fp8_quant(
+        out: torch.Tensor, input: torch.Tensor, residual: torch.Tensor,
+        weight: torch.Tensor, scale: torch.Tensor,
+        epsilon: float) -> None:
+    torch.ops._C.fused_add_rms_norm_static_fp8_quant(
+        out, input, residual, weight, scale, epsilon)
+
+
 def silu_and_mul(out: torch.Tensor, input: torch.Tensor) -> None:
     torch.ops._C.silu_and_mul(out, input)
 

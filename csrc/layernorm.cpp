@@ -202,7 +202,9 @@ void call_rms_norm_kernel(
   auto input_ptr = input.data_ptr<scalar_t>();
   auto weight_ptr = weight.data_ptr<scalar_t>();
   sycl::range<3> grid(1, 1, num_tokens);
-  sycl::range<3> block(1, 1, std::min(hidden_size, 1024));
+  int wg = std::min(hidden_size, 1024);
+  wg = ((wg + 31) / 32) * 32;  // align up to reqd_sub_group_size
+  sycl::range<3> block(1, 1, wg);
   auto& queue = vllm::xpu::vllmGetQueue();
 
   VLLM_DISPATCH_RANK234(num_dims, [&]() {
@@ -306,7 +308,9 @@ void call_fused_add_rms_norm_kernel(
   auto weight_ptr = weight.data_ptr<scalar_t>();
   int64_t input_stride = input.stride(-2);
   sycl::range<3> grid(1, 1, num_tokens);
-  sycl::range<3> block(1, 1, std::min(hidden_size, 1024));
+  int wg = std::min(hidden_size, 1024);
+  wg = ((wg + 31) / 32) * 32;  // align up to reqd_sub_group_size
+  sycl::range<3> block(1, 1, wg);
   auto& queue = vllm::xpu::vllmGetQueue();
   queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> s_variance(sycl::range<1>(1), cgh);

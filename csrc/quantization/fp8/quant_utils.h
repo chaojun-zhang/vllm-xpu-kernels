@@ -93,6 +93,16 @@ struct ConvertWithScaleOp {
   }
 };
 
+// Free-function wrapper matching the upstream CUDA API:
+//   fp8_type scaled_fp8_conversion<is_scale_inverted, fp8_type>(val, scale)
+// Delegates to ConvertWithScaleOp for the actual clamping and conversion.
+template <bool is_scale_inverted, typename fp8_type>
+inline fp8_type scaled_fp8_conversion(float const val, float const scale) {
+  fp8_type result;
+  ConvertWithScaleOp<is_scale_inverted, fp8_type>{scale}(result, val);
+  return result;
+}
+
 // The vector width is fixed at 4 to avoid excessive branching in the kernel,
 // which could degrade performance.
 template <int VEC_SIZE = 4, typename scalar_t, typename dtype_t, typename ScaOp>
