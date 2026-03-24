@@ -18,25 +18,27 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <numeric>
 
 #include "dispatch_utils.h"
 #include "ops.h"
 #include "quantization/fp8/quant_utils.h"
+#include "quantization/vectorization.h"
 #include "type_convert.h"
 #include "utils.h"
 
 namespace vllm {
 
 // ===================================================================
-// Kernel 1a: rms_norm_static_fp8_quant  (vectorized, width > 0)
+// Kernel 1a: rms_norm_static_fp8_quant  (vectorized, VEC_SIZE > 1)
 //
-// Specialization for FP16/BF16 with packed + vectorized ops.
-// Mirrors the CUDA (width > 0) specialization.
+// Mirrors the CUDA rms_norm_static_fp8_quant_kernel<scalar_t, fp8_type, VEC_SIZE>.
+// Uses aligned vec_n_t<scalar_t, VEC_SIZE> loads/stores.
 //
 // out[fp8]  = fp8( (input / rms) * weight / scale )
 // ===================================================================
-template <typename scalar_t, int width, typename fp8_type>
+template <typename scalar_t, int VEC_SIZE, typename fp8_type>
 class rms_norm_static_fp8_quant_vec_kernel {
  public:
   rms_norm_static_fp8_quant_vec_kernel(
@@ -59,13 +61,13 @@ class rms_norm_static_fp8_quant_vec_kernel {
         hidden_size_(hidden_size),
         s_variance_(s_variance) {}
 
-  void operator()[[sycl::reqd_sub_group_size(32)]](
+  void operator() [[sycl::reqd_sub_group_size(32)]](
       const sycl::nd_item<3>& item) const {
-    // Sanity checks on our vector struct and type-punned pointer arithmetic
-    static_assert(std::is_pod_v<_f16Vec<scalar_t, width>>);
-    static_assert(sizeof(_f16Vec<scalar_t, width>) == sizeof(scalar_t) * width);
-
-    using vec_t = _f16Vec<scalar_t, width>;
+    // vec_n_t carries float-promoted operators (*= float, *= vec, sum_squares)
+    // that exactly match _f16Vec semantics — fp16/bf16 arithmetic is always
+    // done as: fp16(float(a) op float(b)).  This ensures bit-exact agreement
+    // with the reference path: rms_norm (uses _f16Vec) → static_fp8_quant.
+    using vec_t = vllm::vec_n_t<scalar_t, VEC_SIZE>;
 
     float* s_variance_ptr =
         s_variance_.template get_multi_ptr<sycl::access::decorated::no>().get();
@@ -73,28 +75,28 @@ class rms_norm_static_fp8_quant_vec_kernel {
     const int wg_id = item.get_group(2);
     const int local_id = item.get_local_id(2);
     const int local_range = item.get_local_range(2);
-    const int vec_hidden_size = hidden_size_ / width;
-    const int vec_input_stride = input_stride_ / width;
+    const int num_vec = hidden_size_ / VEC_SIZE;
+    const int vec_input_stride = input_stride_ / VEC_SIZE;
 
-    auto const* __restrict__ input_v =
+    // no device-side printf — launch params are printed on the host
+
+    const auto* __restrict__ input_v =
         reinterpret_cast<const vec_t*>(input_);
-    auto const* __restrict__ weight_v =
+    const auto* __restrict__ weight_v =
         reinterpret_cast<const vec_t*>(weight_);
 
     // ---- Pass 1: compute variance = sum(x^2) ----------------------------
+    // sum_squares() uses float-promoted accumulation, same as _f16Vec.
     float variance = 0.0f;
 
-    for (int idx = local_id; idx < vec_hidden_size; idx += local_range) {
-      int stride_id = wg_id * vec_input_stride + idx;
-      vec_t temp = input_v[stride_id];
+    for (int idx = local_id; idx < num_vec; idx += local_range) {
+      vec_t temp = input_v[wg_id * vec_input_stride + idx];
       variance += temp.sum_squares();
     }
 
-    // Work-group reduction
     variance = sycl::reduce_over_group(
         sycl::ext::oneapi::this_work_item::get_work_group<3>(),
-        variance,
-        sycl::plus<>());
+        variance, sycl::plus<>());
 
     if (local_id == 0) {
       *s_variance_ptr = sycl::rsqrt(variance / hidden_size_ + epsilon_);
@@ -102,18 +104,22 @@ class rms_norm_static_fp8_quant_vec_kernel {
     item.barrier(sycl::access::fence_space::local_space);
 
     // ---- Pass 2: normalize, weight, quantise to fp8 ---------------------
+    // temp *= rsqrt  → each element: fp16(float(x) * rsqrt)
+    // temp *= weight → each element: fp16(float(normed) * float(w))
+    // Then fp8 = scaled_fp8_conversion(float(fp16_out), scale_inv)
+    // This is identical in structure to fused_add_rms_norm_static_fp8_quant_vec_kernel.
     const float s_variance_val = *s_variance_ptr;
 
-    for (int idx = local_id; idx < vec_hidden_size; idx += local_range) {
-      int stride_id = wg_id * vec_input_stride + idx;
-      int id = wg_id * vec_hidden_size + idx;
-      vec_t temp = input_v[stride_id];
-      temp *= s_variance_val;
-      temp *= weight_v[idx];
-      for (int i = 0; i < width; ++i) {
-        out_[id * width + i] =
+    for (int idx = local_id; idx < num_vec; idx += local_range) {
+      int id = wg_id * num_vec + idx;
+      vec_t temp = input_v[wg_id * vec_input_stride + idx];
+      temp *= s_variance_val;       // fp16(float(x) * rsqrt)   — like _f16Vec *= float
+      temp *= weight_v[idx];        // fp16(float(n) * float(w)) — like _f16Vec *= vec
+#pragma unroll
+      for (int i = 0; i < VEC_SIZE; ++i) {
+        out_[id * VEC_SIZE + i] =
             fp8::scaled_fp8_conversion<true, fp8_type>(
-                static_cast<float>(temp.data[i]), scale_inv_);
+                static_cast<float>(temp.val[i]), scale_inv_);
       }
     }
   }
@@ -131,9 +137,9 @@ class rms_norm_static_fp8_quant_vec_kernel {
 };
 
 // ===================================================================
-// Kernel 1b: rms_norm_static_fp8_quant  (generic, width == 0)
+// Kernel 1b: rms_norm_static_fp8_quant  (scalar, VEC_SIZE == 1)
 //
-// Scalar fallback — no vectorization, no packed ops.
+// Scalar fallback — no vectorization.
 // Mirrors the CUDA (width == 0) specialization.
 //
 // out[fp8]  = fp8( (input / rms) * weight / scale )
@@ -161,7 +167,7 @@ class rms_norm_static_fp8_quant_scalar_kernel {
         hidden_size_(hidden_size),
         s_variance_(s_variance) {}
 
-  void operator()[[sycl::reqd_sub_group_size(32)]](
+  void operator() [[sycl::reqd_sub_group_size(32)]](
       const sycl::nd_item<3>& item) const {
     float* s_variance_ptr =
         s_variance_.template get_multi_ptr<sycl::access::decorated::no>().get();
@@ -194,12 +200,14 @@ class rms_norm_static_fp8_quant_scalar_kernel {
 
     for (int idx = local_id; idx < hidden_size_; idx += local_range) {
       float x = static_cast<float>(input_[wg_id * input_stride_ + idx]);
-      // Truncate to scalar_t after applying rsqrt, then multiply by weight
-      // in scalar_t precision — matches the rms_norm kernel output exactly.
-      float const out_norm = static_cast<float>(
-          static_cast<scalar_t>(x * s_variance_val) * weight_[idx]);
+      // Use float-promoted multiply (matching _f16Vec::operator*= semantics)
+      // to exactly match the reference rms_norm + static_scaled_fp8_quant path.
+      scalar_t normed   = static_cast<scalar_t>(x * s_variance_val);
+      float    out_norm = static_cast<float>(normed) *
+                          static_cast<float>(weight_[idx]);
       out_[wg_id * hidden_size_ + idx] =
-          fp8::scaled_fp8_conversion<true, fp8_type>(out_norm, scale_inv_);
+          fp8::scaled_fp8_conversion<true, fp8_type>(
+              static_cast<float>(static_cast<scalar_t>(out_norm)), scale_inv_);
     }
   }
 
@@ -249,7 +257,7 @@ class fused_add_rms_norm_static_fp8_quant_vec_kernel {
         hidden_size_(hidden_size),
         s_variance_(s_variance) {}
 
-  void operator()[[sycl::reqd_sub_group_size(32)]](
+  void operator() [[sycl::reqd_sub_group_size(32)]](
       const sycl::nd_item<3>& item) const {
     // Sanity checks on our vector struct and type-punned pointer arithmetic
     static_assert(std::is_pod_v<_f16Vec<scalar_t, width>>);
@@ -358,7 +366,7 @@ class fused_add_rms_norm_static_fp8_quant_scalar_kernel {
         hidden_size_(hidden_size),
         s_variance_(s_variance) {}
 
-  void operator()[[sycl::reqd_sub_group_size(32)]](
+  void operator() [[sycl::reqd_sub_group_size(32)]](
       const sycl::nd_item<3>& item) const {
     float* s_variance_ptr =
         s_variance_.template get_multi_ptr<sycl::access::decorated::no>().get();
@@ -369,7 +377,6 @@ class fused_add_rms_norm_static_fp8_quant_scalar_kernel {
 
     // ---- Pass 1: residual += input, compute variance --------------------
     float variance = 0.0f;
-
     for (int idx = local_id; idx < hidden_size_; idx += local_range) {
       scalar_t z = input_[wg_id * input_stride_ + idx];
       z += residual_[wg_id * hidden_size_ + idx];
@@ -381,8 +388,7 @@ class fused_add_rms_norm_static_fp8_quant_scalar_kernel {
     // Work-group reduction
     variance = sycl::reduce_over_group(
         sycl::ext::oneapi::this_work_item::get_work_group<3>(),
-        variance,
-        sycl::plus<>());
+        variance, sycl::plus<>());
 
     if (local_id == 0) {
       *s_variance_ptr = sycl::rsqrt(variance / hidden_size_ + epsilon_);
@@ -422,13 +428,10 @@ class fused_add_rms_norm_static_fp8_quant_scalar_kernel {
 // Host-side entry points
 // ===================================================================
 
-// ===================================================================
-// LAUNCH_RMS_NORM macro — mirrors upstream CUDA exactly.
-//
 // Dispatches scalar_t and fp8_t, then launches the appropriate kernel
-// (vectorized or scalar) based on the width template parameter.
+// (vectorized or scalar) based on the vec_size_val template parameter.
 // ===================================================================
-#define LAUNCH_RMS_NORM(width)                                                 \
+#define LAUNCH_RMS_NORM(vec_size_val)                                          \
   VLLM_DISPATCH_FLOATING_TYPES(                                                \
       input.scalar_type(), "rms_norm_static_fp8_quant_scalar_type", [&] {      \
         using sycl_t = typename vllm::xpu::SyclTypeTrait<scalar_t>::Type;      \
@@ -437,13 +440,13 @@ class fused_add_rms_norm_static_fp8_quant_scalar_kernel {
               queue.submit([&](sycl::handler& cgh) {                           \
                 sycl::local_accessor<float, 1> s_variance(                     \
                     sycl::range<1>(1), cgh);                                   \
-                if constexpr ((width) > 0) {                                   \
+                if constexpr ((vec_size_val) > 1) {                            \
                   cgh.parallel_for(                                            \
                       sycl::nd_range<3>(                                       \
                           num_work_groups * work_group_size,                    \
                           work_group_size),                                     \
                       vllm::rms_norm_static_fp8_quant_vec_kernel<              \
-                          sycl_t, (width), fp8_t>(                             \
+                          sycl_t, (vec_size_val), fp8_t>(                      \
                           out.data_ptr<fp8_t>(),                               \
                           reinterpret_cast<const sycl_t*>(                     \
                               input.data_ptr<scalar_t>()),                     \
@@ -498,32 +501,27 @@ void rms_norm_static_fp8_quant(
      for increased EU occupancy and better latency
      hiding on global mem ops. */
   const int max_work_group_size = (num_tokens < 256) ? 1024 : 256;
-  int wg = std::min(hidden_size, max_work_group_size);
-  wg = ((wg + 31) / 32) * 32;  // align up to reqd_sub_group_size
-  sycl::range<3> work_group_size(1, 1, wg);
   auto& queue = vllm::xpu::vllmGetQueue();
 
-  /* If the tensor types are FP16/BF16, try to use the optimized kernel
-     with packed + vectorized ops.
-     Max optimization is achieved with a width-8 vector of FP16/BF16s
-     since we can load at most 128 bits at once in a global memory op.
-     However, this requires each tensor's data to be aligned to 16
-     bytes. */
-  auto inp_ptr = reinterpret_cast<std::uintptr_t>(input.data_ptr());
-  auto wt_ptr = reinterpret_cast<std::uintptr_t>(weight.data_ptr());
-  bool ptrs_are_aligned = inp_ptr % 16 == 0 && wt_ptr % 16 == 0;
-  if (ptrs_are_aligned && hidden_size % 8 == 0 && input_stride % 8 == 0) {
-    LAUNCH_RMS_NORM(8);
-  } else {
-    LAUNCH_RMS_NORM(0);
-  }
+  VLLM_DISPATCH_FLOATING_TYPES(
+      input.scalar_type(), "rms_norm_static_fp8_quant_scalar_type_outer", [&] {
+        using sycl_t = typename vllm::xpu::SyclTypeTrait<scalar_t>::Type;
+        const int calculated_vec_size =
+            std::gcd((int)(16 / sizeof(sycl_t)), hidden_size);
+        const int block_size =
+            std::min(hidden_size / calculated_vec_size, max_work_group_size);
+        int wg = ((block_size + 31) / 32) * 32;
+        sycl::range<3> work_group_size(1, 1, wg);
+
+        VLLM_DISPATCH_VEC_SIZE(calculated_vec_size, [&] {
+          constexpr int vec_size_val = vec_size;
+          LAUNCH_RMS_NORM(vec_size_val);
+        });
+      });
 }
 
 // ===================================================================
-// LAUNCH_FUSED_ADD_RMS_NORM macro — mirrors upstream CUDA exactly.
-//
-// Dispatches scalar_t and fp8_t, then launches the appropriate kernel
-// (vectorized or scalar) based on the width template parameter.
+// LAUNCH_FUSED_ADD_RMS_NORM macro
 // ===================================================================
 #define LAUNCH_FUSED_ADD_RMS_NORM(width)                                       \
   VLLM_DISPATCH_FLOATING_TYPES(                                                \
@@ -594,7 +592,6 @@ void fused_add_rms_norm_static_fp8_quant(
   int input_stride = input.stride(-2);
   int num_tokens = input.numel() / hidden_size;
 
-  // Pre-compute inverted scale on host to avoid per-work-item global read.
   const float scale_inv = 1.0f / scale.item<float>();
 
   sycl::range<3> num_work_groups(1, 1, num_tokens);
@@ -604,7 +601,7 @@ void fused_add_rms_norm_static_fp8_quant(
      hiding on global mem ops. */
   const int max_work_group_size = (num_tokens < 256) ? 1024 : 256;
   int wg = std::min(hidden_size, max_work_group_size);
-  wg = ((wg + 31) / 32) * 32;  // align up to reqd_sub_group_size
+  wg = ((wg + 31) / 32) * 32;
   sycl::range<3> work_group_size(1, 1, wg);
   auto& queue = vllm::xpu::vllmGetQueue();
 
@@ -616,7 +613,7 @@ void fused_add_rms_norm_static_fp8_quant(
      bytes. */
   auto inp_ptr = reinterpret_cast<std::uintptr_t>(input.data_ptr());
   auto res_ptr = reinterpret_cast<std::uintptr_t>(residual.data_ptr());
-  auto wt_ptr = reinterpret_cast<std::uintptr_t>(weight.data_ptr());
+  auto wt_ptr  = reinterpret_cast<std::uintptr_t>(weight.data_ptr());
   bool ptrs_are_aligned =
       inp_ptr % 16 == 0 && res_ptr % 16 == 0 && wt_ptr % 16 == 0;
   if (ptrs_are_aligned && hidden_size % 8 == 0 && input_stride % 8 == 0) {
