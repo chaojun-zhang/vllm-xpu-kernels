@@ -44,6 +44,7 @@
 #include "ops.h"
 #include "quantization/fp8/quant_utils.h"
 #include "quantization/vectorization.h"
+#include "quantization/vectorization_utils.h"
 #include "utils.h"
 
 namespace vllm {
