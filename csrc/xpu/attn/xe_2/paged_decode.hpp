@@ -317,7 +317,13 @@ struct DecodeKernelLauncher {
          args.total_seqlen_k,
          args.window_size_left,
          args.window_size_right,
-         args.is_interleaved_kv_cache},
+         args.is_interleaved_kv_cache,
+         // page_stride_elements: physical stride between paged blocks in
+         // seq-position units. For contiguous KV this equals block_size; for
+         // cross-layer KV cache it is num_layers * 2 * block_size.
+         (args.k_stride_seq > 0)
+             ? static_cast<int>(args.k_stride_page / args.k_stride_seq)
+             : args.block_size},
         {},
         hw_info,
         args.num_kv_splits};

@@ -72,6 +72,11 @@ struct chunk_prefill_args_t {
   int o_stride_seq = 0;
   int o_stride_heads = 0;
   int o_stride_batch = 0;
+  // Paged KV cache page stride (stride(0) of key/value_cache tensor).
+  // Non-zero only for paged KV; supports non-contiguous block layouts
+  // such as cross-layer KV cache where page_stride != block_size * seq_stride.
+  int64_t k_stride_page = 0;
+  int64_t v_stride_page = 0;
 };
 
 template <class FMHAKernel, bool isVarLen>
@@ -181,7 +186,10 @@ struct KernelLauncher {
          args.total_seqlen_k,
          args.window_size_left,
          args.window_size_right,
-         args.is_interleaved_kv_cache},
+         args.is_interleaved_kv_cache,
+         (args.is_paged && args.k_stride_seq > 0)
+             ? static_cast<int>(args.k_stride_page / args.k_stride_seq)
+             : 0},
         {},
         hw_info};
 
