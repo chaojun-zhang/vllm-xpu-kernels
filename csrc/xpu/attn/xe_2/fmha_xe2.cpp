@@ -177,6 +177,10 @@ void cutlass_chunk_prefill_impl(
       args.v_stride_seq = value_cache.stride(1);
       args.v_stride_heads = value_cache.stride(2);
       args.v_stride_batch = 0;
+      args.k_stride_page =
+          is_interleaved_kv ? key_cache.stride(0) / 2 : key_cache.stride(0);
+      args.v_stride_page =
+          is_interleaved_kv ? value_cache.stride(0) / 2 : value_cache.stride(0);
     } else {
       // K/V: [total_seq_k, num_heads_kv, head_size]
       args.k_stride_seq = key_cache.stride(0);
@@ -202,6 +206,10 @@ void cutlass_chunk_prefill_impl(
       args.v_stride_seq = value_cache.stride(1);
       args.v_stride_heads = value_cache.stride(2);
       args.v_stride_batch = 0;
+      args.k_stride_page =
+          is_interleaved_kv ? key_cache.stride(0) / 2 : key_cache.stride(0);
+      args.v_stride_page =
+          is_interleaved_kv ? value_cache.stride(0) / 2 : value_cache.stride(0);
     } else {
       // K/V: [batch, num_heads_kv, seq, head_size]
       args.k_stride_seq = key_cache.stride(2);
@@ -210,6 +218,20 @@ void cutlass_chunk_prefill_impl(
       args.v_stride_seq = value_cache.stride(2);
       args.v_stride_heads = value_cache.stride(1);
       args.v_stride_batch = value_cache.stride(0);
+    }
+  }
+
+  // For non-contiguous paged KV (e.g., cross-layer KV cache), enlarge
+  // total_seqlen_k to cover the full physical extent for the 2D block
+  // load surface descriptor. Without this, block loads for blocks at
+  // higher physical addresses would return zeros.
+  if (is_paged && args.k_stride_seq > 0) {
+    int64_t page_stride_elements = args.k_stride_page / args.k_stride_seq;
+    int64_t num_blocks_physical = key_cache.size(0);
+    int64_t effective_total = num_blocks_physical * page_stride_elements;
+    if (is_interleaved_kv) effective_total *= 2;
+    if (effective_total > args.total_seqlen_k) {
+      args.total_seqlen_k = static_cast<int>(effective_total);
     }
   }
 

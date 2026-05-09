@@ -152,6 +152,24 @@ void cutlass_paged_decode_impl(
     total_seqlen_k = num_blocks * block_size;
 
     is_interleaved_kv = is_interleaved_kv_cache(key_cache, value_cache);
+
+    // For non-contiguous paged KV (e.g., cross-layer KV cache), enlarge
+    // total_seqlen_k to cover the full physical extent for the 2D block
+    // load surface descriptor. Without this, block loads for blocks at
+    // higher physical addresses would return zeros.
+    {
+      int64_t k_stride_page =
+          is_interleaved_kv ? key_cache.stride(0) / 2 : key_cache.stride(0);
+      int64_t k_stride_seq = key_cache.stride(1);
+      if (k_stride_seq > 0) {
+        int64_t page_stride_elements = k_stride_page / k_stride_seq;
+        int64_t effective_total = (int64_t)num_blocks * page_stride_elements;
+        if (is_interleaved_kv) effective_total *= 2;
+        if (effective_total > total_seqlen_k) {
+          total_seqlen_k = static_cast<int>(effective_total);
+        }
+      }
+    }
   }
 
   if (is_local) {
