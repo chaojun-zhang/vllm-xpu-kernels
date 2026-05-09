@@ -210,6 +210,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "    Tensor suffix_output,"
       "    Tensor suffix_lse) -> ()");
   ops.impl("merge_attn_states", torch::kXPU, &merge_attn_states);
+
+  // AWQ weight dequantization (XPU implementation).
+  // The op schema is defined in vllm's torch_bindings.cpp (CUDA side);
+  // here we only register the XPU dispatch key.
+  ops.def(
+      "awq_dequantize(Tensor _kernel, Tensor _scaling_factors, "
+      "Tensor _zeros, SymInt split_k_iters, int thx, int thy) -> Tensor");
+  ops.impl("awq_dequantize", torch::kXPU, &awq_dequantize);
 }
 
 TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
