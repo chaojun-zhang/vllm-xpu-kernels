@@ -2,6 +2,8 @@
 #include "paged_decode_utils.hpp"
 #include "paged_decode_extern.hpp"
 
+#include <limits>
+
 using namespace cute;
 
 void cutlass_paged_decode_xe2(
@@ -161,16 +163,29 @@ void cutlass_paged_decode_impl(
       int64_t k_stride_page =
           is_interleaved_kv ? key_cache.stride(0) / 2 : key_cache.stride(0);
       int64_t k_stride_seq = key_cache.stride(1);
-      if (k_stride_seq > 0) {
-        int64_t page_stride_elements = k_stride_page / k_stride_seq;
-        int64_t effective_total = (int64_t)num_blocks * page_stride_elements;
-        if (is_interleaved_kv) effective_total *= 2;
-        TORCH_CHECK(
-            effective_total <= std::numeric_limits<int>::max(),
-            "effective_total exceeds int32 range");
-        if (effective_total > total_seqlen_k) {
-          total_seqlen_k = static_cast<int>(effective_total);
-        }
+      TORCH_CHECK(
+          k_stride_seq > 0,
+          "Paged K sequence stride must be positive: k_stride_seq=",
+          k_stride_seq);
+      TORCH_CHECK(
+          k_stride_page % k_stride_seq == 0,
+          "Paged K page stride must be divisible by K sequence stride: ",
+          "k_stride_page=",
+          k_stride_page,
+          " k_stride_seq=",
+          k_stride_seq);
+      int64_t page_stride_elements = k_stride_page / k_stride_seq;
+      TORCH_CHECK(
+          page_stride_elements <= std::numeric_limits<int>::max(),
+          "Paged K page stride in sequence elements exceeds int32 range: ",
+          page_stride_elements);
+      int64_t effective_total = (int64_t)num_blocks * page_stride_elements;
+      if (is_interleaved_kv) effective_total *= 2;
+      TORCH_CHECK(
+          effective_total <= std::numeric_limits<int>::max(),
+          "effective_total exceeds int32 range");
+      if (effective_total > total_seqlen_k) {
+        total_seqlen_k = static_cast<int>(effective_total);
       }
     }
   }

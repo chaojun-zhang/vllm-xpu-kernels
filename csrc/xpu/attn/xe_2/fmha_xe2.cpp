@@ -2,6 +2,8 @@
 #include "chunk_prefill_utils.hpp"
 #include "chunk_prefill_extern.hpp"
 
+#include <limits>
+
 using namespace cute;
 
 void cutlass_chunk_prefill_xe2(
@@ -179,8 +181,6 @@ void cutlass_chunk_prefill_impl(
       args.v_stride_batch = 0;
       args.k_stride_page =
           is_interleaved_kv ? key_cache.stride(0) / 2 : key_cache.stride(0);
-      args.v_stride_page =
-          is_interleaved_kv ? value_cache.stride(0) / 2 : value_cache.stride(0);
     } else {
       // K/V: [total_seq_k, num_heads_kv, head_size]
       args.k_stride_seq = key_cache.stride(0);
@@ -208,8 +208,6 @@ void cutlass_chunk_prefill_impl(
       args.v_stride_batch = 0;
       args.k_stride_page =
           is_interleaved_kv ? key_cache.stride(0) / 2 : key_cache.stride(0);
-      args.v_stride_page =
-          is_interleaved_kv ? value_cache.stride(0) / 2 : value_cache.stride(0);
     } else {
       // K/V: [batch, num_heads_kv, seq, head_size]
       args.k_stride_seq = key_cache.stride(2);
@@ -225,8 +223,23 @@ void cutlass_chunk_prefill_impl(
   // total_seqlen_k to cover the full physical extent for the 2D block
   // load surface descriptor. Without this, block loads for blocks at
   // higher physical addresses would return zeros.
-  if (is_paged && args.k_stride_seq > 0) {
+  if (is_paged) {
+    TORCH_CHECK(
+        args.k_stride_seq > 0,
+        "Paged K sequence stride must be positive: k_stride_seq=",
+        args.k_stride_seq);
+    TORCH_CHECK(
+        args.k_stride_page % args.k_stride_seq == 0,
+        "Paged K page stride must be divisible by K sequence stride: ",
+        "k_stride_page=",
+        args.k_stride_page,
+        " k_stride_seq=",
+        args.k_stride_seq);
     int64_t page_stride_elements = args.k_stride_page / args.k_stride_seq;
+    TORCH_CHECK(
+        page_stride_elements <= std::numeric_limits<int>::max(),
+        "Paged K page stride in sequence elements exceeds int32 range: ",
+        page_stride_elements);
     int64_t num_blocks_physical = key_cache.size(0);
     int64_t effective_total = num_blocks_physical * page_stride_elements;
     if (is_interleaved_kv) effective_total *= 2;

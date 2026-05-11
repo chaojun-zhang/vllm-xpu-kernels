@@ -13,6 +13,7 @@
 #include "cutlass/util/reference/device/gemm_complex.h"
 #include "cutlass/util/reference/device/tensor_compare.h"
 
+#include <limits>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 #include "collective/chunk_prefill_scheduler.hpp"
@@ -290,6 +291,23 @@ struct DecodeKernelLauncher {
       const paged_decode_args_t& args,
       const cutlass::KernelHardwareInfo& hw_info) {
     ProblemShapeType shape = initialize(args);
+    TORCH_CHECK(
+        args.k_stride_seq > 0,
+        "Paged K sequence stride must be positive: k_stride_seq=",
+        args.k_stride_seq);
+    TORCH_CHECK(
+        args.k_stride_page % args.k_stride_seq == 0,
+        "Paged K page stride must be divisible by K sequence stride: ",
+        "k_stride_page=",
+        args.k_stride_page,
+        " k_stride_seq=",
+        args.k_stride_seq);
+    int64_t page_stride_elements_i64 = args.k_stride_page / args.k_stride_seq;
+    TORCH_CHECK(
+        page_stride_elements_i64 <= std::numeric_limits<int>::max(),
+        "Paged K page stride in sequence elements exceeds int32 range: ",
+        page_stride_elements_i64);
+    int page_stride_elements = static_cast<int>(page_stride_elements_i64);
 
     typename FMHAKernel::Arguments arguments{
         {
@@ -321,9 +339,7 @@ struct DecodeKernelLauncher {
          // page_stride_elements: physical stride between paged blocks in
          // seq-position units. For contiguous KV this equals block_size; for
          // cross-layer KV cache it is num_layers * 2 * block_size.
-         (args.k_stride_seq > 0)
-             ? static_cast<int>(args.k_stride_page / args.k_stride_seq)
-             : args.block_size},
+         page_stride_elements},
         {},
         hw_info,
         args.num_kv_splits};

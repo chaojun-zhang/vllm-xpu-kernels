@@ -13,6 +13,7 @@
 #include "cutlass/util/reference/device/gemm_complex.h"
 #include "cutlass/util/reference/device/tensor_compare.h"
 
+#include <limits>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 #include "collective/chunk_prefill_scheduler.hpp"
@@ -72,11 +73,10 @@ struct chunk_prefill_args_t {
   int o_stride_seq = 0;
   int o_stride_heads = 0;
   int o_stride_batch = 0;
-  // Paged KV cache page stride (stride(0) of key/value_cache tensor).
+  // Paged K cache page stride (stride(0) of key_cache tensor).
   // Non-zero only for paged KV; supports non-contiguous block layouts
   // such as cross-layer KV cache where page_stride != block_size * seq_stride.
   int64_t k_stride_page = 0;
-  int64_t v_stride_page = 0;
 };
 
 template <class FMHAKernel, bool isVarLen>
@@ -163,6 +163,27 @@ struct KernelLauncher {
       const chunk_prefill_args_t& args,
       const cutlass::KernelHardwareInfo& hw_info) {
     ProblemShapeType shape = initialize(args);
+    int page_stride_elements = 0;
+    if (args.is_paged) {
+      TORCH_CHECK(
+          args.k_stride_seq > 0,
+          "Paged K sequence stride must be positive: k_stride_seq=",
+          args.k_stride_seq);
+      TORCH_CHECK(
+          args.k_stride_page % args.k_stride_seq == 0,
+          "Paged K page stride must be divisible by K sequence stride: ",
+          "k_stride_page=",
+          args.k_stride_page,
+          " k_stride_seq=",
+          args.k_stride_seq);
+      int64_t page_stride_elements_i64 =
+          args.k_stride_page / args.k_stride_seq;
+      TORCH_CHECK(
+          page_stride_elements_i64 <= std::numeric_limits<int>::max(),
+          "Paged K page stride in sequence elements exceeds int32 range: ",
+          page_stride_elements_i64);
+      page_stride_elements = static_cast<int>(page_stride_elements_i64);
+    }
 
     typename FMHAKernel::Arguments arguments{
         {shape,
@@ -187,9 +208,7 @@ struct KernelLauncher {
          args.window_size_left,
          args.window_size_right,
          args.is_interleaved_kv_cache,
-         (args.is_paged && args.k_stride_seq > 0)
-             ? static_cast<int>(args.k_stride_page / args.k_stride_seq)
-             : 0},
+         page_stride_elements},
         {},
         hw_info};
 
