@@ -210,6 +210,24 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "    Tensor suffix_output,"
       "    Tensor suffix_lse) -> ()");
   ops.impl("merge_attn_states", torch::kXPU, &merge_attn_states);
+
+  // AWQ weight dequantization (XPU implementation).
+  // The op schema is defined in vllm's torch_bindings.cpp (CUDA side);
+  // here we only register the XPU dispatch key.
+  ops.def(
+      "awq_dequantize(Tensor _kernel, Tensor _scaling_factors, "
+      "Tensor _zeros, SymInt split_k_iters, int thx, int thy) -> Tensor");
+  ops.impl("awq_dequantize", torch::kXPU, &awq_dequantize);
+
+  // GPTQ weight shuffle (XPU implementation).
+  ops.def("gptq_shuffle(Tensor! q_weight, Tensor q_perm, int bit) -> ()");
+  ops.impl("gptq_shuffle", torch::kXPU, &gptq_shuffle);
+
+  // GPTQ Marlin repack: convert GPTQ-packed weights to Marlin format.
+  ops.def(
+      "gptq_marlin_repack(Tensor b_q_weight, Tensor perm, "
+      "SymInt size_k, SymInt size_n, int num_bits, bool is_a_8bit) -> Tensor");
+  ops.impl("gptq_marlin_repack", torch::kXPU, &gptq_marlin_repack);
 }
 
 TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {

@@ -253,3 +253,20 @@ void merge_attn_states(
     const torch::Tensor& prefix_lse,
     const torch::Tensor& suffix_output,
     const torch::Tensor& suffix_lse);
+
+// AWQ weight dequantization: unpacks 8 int4 nibbles per int32 element.
+torch::Tensor awq_dequantize(torch::Tensor _kernel,
+                             torch::Tensor _scaling_factors,
+                             torch::Tensor _zeros, int64_t split_k_iters,
+                             int64_t thx, int64_t thy);
+
+// GPTQ weight shuffle: reorders packed quantized weights for exllama format.
+void gptq_shuffle(torch::Tensor q_weight, torch::Tensor q_perm, int64_t bit);
+
+// GPTQ Marlin repack: repacks GPTQ-packed weights into Marlin format.
+torch::Tensor gptq_marlin_repack(torch::Tensor& b_q_weight,
+                                  torch::Tensor& perm,
+                                  int64_t size_k,
+                                  int64_t size_n,
+                                  int64_t num_bits,
+                                  bool is_a_8bit);

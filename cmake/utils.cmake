@@ -485,6 +485,14 @@ function(define_gpu_extension_target GPU_MOD_NAME)
   if(GPU_USE_SABI)
     python_add_library(${GPU_MOD_NAME} MODULE USE_SABI ${GPU_USE_SABI}
                        ${GPU_WITH_SOABI} "${GPU_SOURCES}")
+    # USE_SABI sets Py_LIMITED_API which breaks pybind11; remove it while
+    # keeping the stable ABI filename suffix (.abi3.so).
+    get_target_property(_EXISTING_DEFS ${GPU_MOD_NAME} COMPILE_DEFINITIONS)
+    if(_EXISTING_DEFS)
+      list(REMOVE_ITEM _EXISTING_DEFS "Py_LIMITED_API=${GPU_USE_SABI}")
+      set_target_properties(${GPU_MOD_NAME} PROPERTIES COMPILE_DEFINITIONS
+                                                       "${_EXISTING_DEFS}")
+    endif()
   else()
     python_add_library(${GPU_MOD_NAME} MODULE ${GPU_WITH_SOABI}
                        "${GPU_SOURCES}")
