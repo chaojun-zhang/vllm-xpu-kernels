@@ -221,7 +221,8 @@ void cutlass_chunk_prefill_impl(
   if (is_paged) {
     args.page_stride_elements = static_cast<int>(
         get_paged_kv_cache_page_stride_elements(key_cache));
-    int64_t effective_total = get_paged_kv_cache_effective_total_seqlen(key_cache);
+    int64_t effective_total =
+        get_paged_kv_cache_effective_total_seqlen(key_cache);
     if (effective_total > args.total_seqlen_k) {
       args.total_seqlen_k = static_cast<int>(effective_total);
     }

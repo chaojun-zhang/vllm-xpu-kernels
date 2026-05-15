@@ -159,8 +159,11 @@ void cutlass_paged_decode_impl(
         window_size_right == -1 ? max_seqlen_k : window_size_right;
   }
 
-  int page_stride_elements = static_cast<int>(
-      get_paged_kv_cache_page_stride_elements(key_cache));
+  int page_stride_elements = 0;
+  if (is_paged) {
+    page_stride_elements = static_cast<int>(
+        get_paged_kv_cache_page_stride_elements(key_cache));
+  }
 
   paged_decode_args_t args = {
       query.data_ptr(),
@@ -196,8 +199,10 @@ void cutlass_paged_decode_impl(
       is_local,
       is_sink,
       num_kv_splits,
+      key_cache.stride(0),
       key_cache.stride(1),
       key_cache.stride(2),
+      value_cache.stride(0),
       value_cache.stride(1),
       value_cache.stride(2),
       is_prefill.has_value() ? is_prefill.value().data_ptr() : nullptr,
@@ -213,7 +218,8 @@ void cutlass_paged_decode_impl(
   // load surface descriptor. Without this, block loads for blocks at
   // higher physical addresses would return zeros.
   if (is_paged) {
-    int64_t effective_total = get_paged_kv_cache_effective_total_seqlen(key_cache);
+    int64_t effective_total =
+        get_paged_kv_cache_effective_total_seqlen(key_cache);
     if (effective_total > args.total_seqlen_k) {
       args.total_seqlen_k = static_cast<int>(effective_total);
     }
