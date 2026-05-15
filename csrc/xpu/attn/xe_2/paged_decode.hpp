@@ -116,13 +116,10 @@ struct paged_decode_args_t {
   bool is_causal = false;
   bool is_local = false;
   bool is_sink = false;
-  bool is_interleaved_kv_cache = false;
   int num_kv_splits = 1;
   // KV cache strides [num_blocks, block_size, num_heads_kv, head_size]
-  int64_t k_stride_page = 0;
   int64_t k_stride_seq = 0;
   int64_t k_stride_heads = 0;
-  int64_t v_stride_page = 0;
   int64_t v_stride_seq = 0;
   int64_t v_stride_heads = 0;
   // per-batch mask: true = prefill, false = decode; nullptr = process all
@@ -239,34 +236,40 @@ struct DecodeKernelLauncher {
       // layouts such as MLA combined KV cache)
       constexpr int64_t kIntMax =
           static_cast<int64_t>(std::numeric_limits<int>::max());
+      int64_t k_physical_page_stride =
+          static_cast<int64_t>(args.page_stride_elements) * args.k_stride_seq;
+      int64_t v_physical_page_stride =
+          static_cast<int64_t>(args.page_stride_elements) * args.v_stride_seq;
       TORCH_CHECK(
           args.k_stride_seq <= kIntMax && args.k_stride_heads <= kIntMax &&
-              args.k_stride_page <= kIntMax && args.v_stride_seq <= kIntMax &&
-              args.v_stride_heads <= kIntMax && args.v_stride_page <= kIntMax,
+              k_physical_page_stride <= kIntMax &&
+              args.v_stride_seq <= kIntMax &&
+              args.v_stride_heads <= kIntMax &&
+              v_physical_page_stride <= kIntMax,
           "KV cache stride exceeds int32 max (",
           kIntMax,
           "): k_stride_seq=",
           args.k_stride_seq,
           " k_stride_heads=",
           args.k_stride_heads,
-          " k_stride_page=",
-          args.k_stride_page,
+          " k_physical_page_stride=",
+          k_physical_page_stride,
           " v_stride_seq=",
           args.v_stride_seq,
           " v_stride_heads=",
           args.v_stride_heads,
-          " v_stride_page=",
-          args.v_stride_page);
+          " v_physical_page_stride=",
+          v_physical_page_stride);
       stride_K = StrideK{
           static_cast<int>(args.k_stride_seq),
           _1{},
           static_cast<int>(args.k_stride_heads),
-          static_cast<int>(args.k_stride_page)};
+          static_cast<int>(k_physical_page_stride)};
       stride_V = StrideV{
           _1{},
           static_cast<int>(args.v_stride_seq),
           static_cast<int>(args.v_stride_heads),
-          static_cast<int>(args.v_stride_page)};
+          static_cast<int>(v_physical_page_stride)};
     } else {
       stride_K = cutlass::make_cute_packed_stride(
           StrideK{},
@@ -327,10 +330,8 @@ struct DecodeKernelLauncher {
          args.total_seqlen_k,
          args.window_size_left,
          args.window_size_right,
-         args.is_interleaved_kv_cache,
          // page_stride_elements: physical stride between paged blocks in
-         // seq-position units. For contiguous KV this equals block_size; for
-         // cross-layer KV cache it is num_layers * 2 * block_size.
+         // seq-position units. It includes interleaved and cross-layer gaps.
          args.page_stride_elements},
         {},
         hw_info,
