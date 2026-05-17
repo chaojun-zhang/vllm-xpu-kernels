@@ -66,6 +66,46 @@ torch::Tensor check_and_create_output_tensor(
   return at::empty_strided(result_shape, res_stride, options);
 }
 
+void check_fp8_gemm_output_tensor(
+    const torch::Tensor& out,
+    const torch::Tensor& A,
+    const torch::Tensor& B) {
+  TORCH_CHECK(
+      A.dim() == 2 || A.dim() == 3,
+      "OneDNN Matmul only support 2D and 3D inputs!\n");
+  TORCH_CHECK(B.dim() == 2, "OneDNN Matmul only support 2D weights!\n");
+  TORCH_CHECK(
+      out.scalar_type() == torch::kFloat16 ||
+          out.scalar_type() == torch::kBFloat16,
+      "output must be float16 or bfloat16 for fp8 matmul");
+  TORCH_CHECK(
+      out.device() == A.device(),
+      "fp8_gemm_out output and input must be on the same device");
+
+  if (A.dim() == 2) {
+    TORCH_CHECK(
+        out.dim() == 2 && out.size(0) == A.size(0) && out.size(1) == B.size(1),
+        "fp8_gemm_out output shape mismatch, expected [",
+        A.size(0),
+        ", ",
+        B.size(1),
+        "], got ",
+        out.sizes());
+  } else {
+    TORCH_CHECK(
+        out.dim() == 3 && out.size(0) == A.size(0) &&
+            out.size(1) == A.size(1) && out.size(2) == B.size(1),
+        "fp8_gemm_out output shape mismatch, expected [",
+        A.size(0),
+        ", ",
+        A.size(1),
+        ", ",
+        B.size(1),
+        "], got ",
+        out.sizes());
+  }
+}
+
 torch::Tensor fp8_gemm(
     const torch::Tensor& A,  // [b, m ,k]
     const torch::Tensor& B,  // [k, n]
@@ -138,6 +178,27 @@ torch::Tensor fp8_bmm(
   oneDNN::dnnl_batch_matmul_w8a8_fp8(
       result, A, B, is_nt, bias_, A_scale, B_scale);
   return result;
+}
+
+void fp8_gemm_out(
+    torch::Tensor& out,
+    const torch::Tensor& A,
+    const torch::Tensor& B,
+    const std::optional<torch::Tensor>& A_scale_,
+    const std::optional<torch::Tensor>& B_scale_,
+    const std::optional<torch::Tensor>& bias_) {
+  const at::DeviceGuard device_guard(A.device());
+  check_fp8_gemm_output_tensor(out, A, B);
+  auto a_st = A.scalar_type();
+  auto b_st = B.scalar_type();
+  TORCH_CHECK(
+      is_supported_fp8(a_st) && is_supported_fp8(b_st) && a_st == b_st,
+      "input and weight must be f8_e5m2 or f8_e4m3fn for fp8 matmul");
+  bool is_nt = B.strides()[B.dim() - 2] == 1;
+
+  torch::Tensor A_scale = A_scale_.value_or(at::ones({1}, torch::kFloat));
+  torch::Tensor B_scale = B_scale_.value_or(at::ones({1}, torch::kFloat));
+  oneDNN::dnnl_matmul_w8a8_fp8(out, A, B, is_nt, bias_, A_scale, B_scale);
 }
 
 torch::Tensor fp8_gemm_w8a16(
