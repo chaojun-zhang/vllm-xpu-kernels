@@ -25,8 +25,38 @@ static inline void dnnl_matmul_w8a8_fp8(
   const int n = o_sz.back();  // presume channel last format
   const int k = *(src_sz.end() - 1);
 
-  // block quant param
-  bool is_block_quant = (m1_sc.dim() == 2) && (m2_sc.dim() == 2) &&
+  // Get scale dtypes early to determine quantization mode.
+  auto m1_sc_dtype = m1_sc.scalar_type();
+  auto m2_sc_dtype = m2_sc.scalar_type();
+
+  // Debug: print actual C++ scalar types to verify XPU dtype behaviour.
+  // Remove after root cause is confirmed.
+  static std::atomic<int> _dbg_fp8_count{0};
+  if (_dbg_fp8_count.fetch_add(1) < 4) {
+    fprintf(stderr,
+            "[DBG fp8_gemm] m1_sc scalar_type=%d (%s) m2_sc scalar_type=%d (%s)\n",
+            static_cast<int>(m1_sc_dtype),
+            c10::toString(m1_sc_dtype),
+            static_cast<int>(m2_sc_dtype),
+            c10::toString(m2_sc_dtype));
+  }
+
+  // On XPU, torch.empty(dtype=float8_e8m0fnu) may produce a Byte (uint8)
+  // tensor at the C++ ATen level because the XPU backend does not always
+  // register Float8_e8m0fnu as a first-class storage type.  The byte layout
+  // is identical (1 byte per element), so treat Byte scale tensors as MXFP8
+  // (Float8_e8m0fnu) throughout this function.
+  auto is_mxfp8_scale_dtype = [](at::ScalarType dt) {
+    return dt == at::ScalarType::Float8_e8m0fnu ||
+           dt == at::ScalarType::Byte;
+  };
+
+  // block quant param (only for non-MXFP8 path).
+  // For MXFP8 (Float8_e8m0fnu), weight scale uses OneDNN's expected [k//32, n]
+  // layout, so m2_sc.size(1) == n != k//32 == m1_sc.size(1) for typical layers.
+  // The is_block_quant size equality check must be skipped for MXFP8.
+  bool is_block_quant = !is_mxfp8_scale_dtype(m1_sc_dtype) &&
+                        (m1_sc.dim() == 2) && (m2_sc.dim() == 2) &&
                         (m1_sc.size(1) != 1) && (m2_sc.size(1) != 1);
   int64_t group_size = -1;
   if (is_block_quant) {
@@ -82,28 +112,28 @@ static inline void dnnl_matmul_w8a8_fp8(
                     : mat2.strides()[mat2.dim() - 1];
   int64_t ldc = result.strides()[leading_dim];
 
-  auto m1_sc_dtype = m1_sc.scalar_type();
-  auto m2_sc_dtype = m2_sc.scalar_type();
   auto f_attr = [&](dnnl::primitive_attr& pattr) {
     pattr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
-    if (m1_sc_dtype == at::ScalarType::Float8_e8m0fnu) {
+    if (is_mxfp8_scale_dtype(m1_sc_dtype)) {
       TORCH_CHECK(
-          m2_sc_dtype == at::ScalarType::Float8_e8m0fnu,
+          is_mxfp8_scale_dtype(m2_sc_dtype),
           "Mismatched scale data types in mxfp8 matmul: ",
           m1_sc_dtype,
           " vs ",
           m2_sc_dtype);
+      // Always use e8m0 for oneDNN — the tensor may appear as Byte on XPU
+      // even when it was created as float8_e8m0fnu (identical byte layout).
       pattr.set_scales(
           DNNL_ARG_SRC,
           /* mask */ (1 << 0) + (1 << 1),
           {1, 32},
-          get_onednn_dtype(m1_sc));
+          memory::data_type::e8m0);
       pattr.set_scales(
           DNNL_ARG_WEIGHTS,
           /* mask */ (1 << 0) + (1 << 1),
           {32, 1},
-          get_onednn_dtype(m2_sc));
+          memory::data_type::e8m0);
     } else {
       if (m1_sc.numel() == 1) {
         pattr.set_scales(
@@ -172,13 +202,21 @@ static inline void dnnl_matmul_w8a8_fp8(
       DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS,
       m2_sc.data_ptr(),
       [&]() {
-        return make_onednn_memory(
-            get_onednn_md(m2_sc), engine, m2_sc.data_ptr());
+        // Use e8m0 memory descriptor for MXFP8 scale (tensor may appear as
+        // Byte on XPU even when created as float8_e8m0fnu).
+        auto md = is_mxfp8_scale_dtype(m2_sc_dtype)
+            ? memory::desc{get_onednn_dims(m2_sc), memory::data_type::e8m0,
+                           get_onednn_strides(m2_sc)}
+            : get_onednn_md(m2_sc);
+        return make_onednn_memory(md, engine, m2_sc.data_ptr());
       });
   matmul_ext.set_attribute(
       arg_off++, DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC, m1_sc.data_ptr(), [&]() {
-        return make_onednn_memory(
-            get_onednn_md(m1_sc), engine, m1_sc.data_ptr());
+        auto md = is_mxfp8_scale_dtype(m1_sc_dtype)
+            ? memory::desc{get_onednn_dims(m1_sc), memory::data_type::e8m0,
+                           get_onednn_strides(m1_sc)}
+            : get_onednn_md(m1_sc);
+        return make_onednn_memory(md, engine, m1_sc.data_ptr());
       });
 
   std::vector<std::pair<int, void*>> arg_handles;
