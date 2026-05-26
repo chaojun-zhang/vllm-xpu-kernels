@@ -106,6 +106,21 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int group_size, float eps=1e-10) -> ()");
   ops.impl("silu_and_mul_mxfp4_quant", torch::kXPU, &silu_and_mul_mxfp4_quant);
 
+  // Fused SiLU + Mul + per-block dynamic quantization (FP8 or INT8).
+  // Mirrors the CUDA op schema in vllm csrc/torch_bindings.cpp.
+  ops.def(
+      "silu_and_mul_per_block_quant("
+      "Tensor! out, "
+      "Tensor input, "
+      "Tensor! scales, "
+      "int group_size, "
+      "Tensor? scale_ub=None, "
+      "bool is_scale_transposed=False) -> ()");
+  ops.impl(
+      "silu_and_mul_per_block_quant",
+      torch::kXPU,
+      &silu_and_mul_per_block_quant);
+
   ops.def("mul_and_silu(Tensor! out, Tensor input) -> ()");
   ops.impl("mul_and_silu", torch::kXPU, &mul_and_silu);
 
