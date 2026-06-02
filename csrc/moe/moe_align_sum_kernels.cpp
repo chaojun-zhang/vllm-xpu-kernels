@@ -150,7 +150,8 @@ void _moe_align_block_size(
     int32_t model_offset,
     int32_t inactive_expert_id,
     int32_t topk_num,
-    int32_t* token_mask,
+    const int32_t* token_lora_mapping,
+    int32_t lora_id_filter,
     bool has_expert_map,
     sycl::local_accessor<int32_t, 1> slm,
     sycl::nd_item<1> item) {
@@ -205,7 +206,11 @@ void _moe_align_block_size(
     }
     int warp_idx = expert_id / experts_per_warp;
     int expert_offset = expert_id % experts_per_warp;
-    int mask = token_mask == nullptr ? 1 : token_mask[i / topk_num];
+    int mask = (token_lora_mapping == nullptr) ? 1
+               : (static_cast<int32_t>(token_lora_mapping[i / topk_num]) ==
+                          lora_id_filter
+                      ? 1
+                      : 0);
 
     sycl::atomic_ref<
         int,
@@ -423,7 +428,8 @@ void _count_and_sort_expert_tokens(
     size_t numel,
     int32_t num_experts,
     int32_t max_num_tokens_padded,
-    int32_t* __restrict__ token_mask,
+    const int32_t* __restrict__ token_lora_mapping,
+    int32_t lora_id_filter,
     int32_t model_offset,
     int32_t topk_num,
     bool has_expert_map,
@@ -448,7 +454,9 @@ void _count_and_sort_expert_tokens(
       if (expert_id == -1) continue;
     }
 
-    if (token_mask == nullptr || token_mask[i / topk_num]) {
+    if (token_lora_mapping == nullptr ||
+        static_cast<int32_t>(token_lora_mapping[i / topk_num]) ==
+            lora_id_filter) {
       int32_t* cumsum_ptr =
           &cumsum_buffer[(model_offset * (num_experts + 1)) + expert_id];
 
@@ -538,6 +546,7 @@ class moe_align_block_size_kernel {
         0,
         topk_num,
         nullptr,
+        -1,
         has_expert_map,
         slm,
         item);
@@ -588,6 +597,7 @@ class count_and_sort_expert_tokens_kernel {
         num_experts,
         max_num_tokens_padded,
         nullptr,
+        -1,
         0,
         topk_num,
         has_expert_map,
@@ -707,7 +717,6 @@ class moe_lora_align_block_size_kernel {
   int32_t experts_per_warp;
   int32_t padded_num_experts;
   int32_t* lora_ids;
-  int32_t* __restrict__ token_mask;
   bool has_expert_map;
   sycl::local_accessor<int32_t, 1> slm;
 
@@ -731,7 +740,6 @@ class moe_lora_align_block_size_kernel {
       int32_t experts_per_warp,
       int32_t padded_num_experts,
       int32_t* lora_ids,
-      int32_t* token_mask,
       bool has_expert_map,
       sycl::local_accessor<int32_t, 1> slm)
       : topk_ids(topk_ids),
@@ -752,7 +760,6 @@ class moe_lora_align_block_size_kernel {
         experts_per_warp(experts_per_warp),
         padded_num_experts(padded_num_experts),
         lora_ids(lora_ids),
-        token_mask(token_mask),
         has_expert_map(has_expert_map),
         slm(slm) {}
 
@@ -767,19 +774,13 @@ class moe_lora_align_block_size_kernel {
       return;
     }
 
-    // Populate the token_mask based on the token-LoRA mapping
-    int num_tokens = numel / topk_num;
-    if (item.get_local_id(0) == 0) {
-      total_tokens_post_pad[lora_id] = 0;
-
-      for (int i = 0; i < num_tokens; i++) {
-        token_mask[(lora_id * num_tokens) + i] =
-            static_cast<int>(token_lora_mapping[i]) == lora_id;
-      }
-    }
-
-    item.barrier(sycl::access::fence_space::global_and_local);
-
+    // Pass token_lora_mapping and lora_id directly so each counting thread
+    // reads the per-token lora assignment from global memory (a read-only
+    // tensor written before kernel launch). This avoids the write-then-read
+    // race that occurs when thread 0 pre-populates token_mask to global memory
+    // and other threads try to read it after a barrier — a pattern that is
+    // unreliable on Intel XPU because global_and_local barriers compile
+    // identically to local_space barriers.
     _moe_align_block_size(
         topk_ids,
         sorted_token_ids,
@@ -797,7 +798,8 @@ class moe_lora_align_block_size_kernel {
         lora_id,
         -1,
         topk_num,
-        &token_mask[(lora_id * num_tokens)],
+        token_lora_mapping,
+        lora_id,
         has_expert_map,
         slm,
         item);
@@ -815,7 +817,7 @@ class lora_count_and_sort_expert_tokens_kernel {
   int32_t num_experts;
   int32_t max_num_tokens_padded;
   int32_t topk_num;
-  int32_t* token_mask;
+  const int32_t* token_lora_mapping;
   int32_t max_loras;
   int32_t* adapter_enabled;
   int32_t* lora_ids;
@@ -831,7 +833,7 @@ class lora_count_and_sort_expert_tokens_kernel {
       int32_t num_experts,
       int32_t max_num_tokens_padded,
       int32_t topk_num,
-      int32_t* token_mask,
+      const int32_t* token_lora_mapping,
       int32_t max_loras,
       int32_t* adapter_enabled,
       int32_t* lora_ids,
@@ -844,7 +846,7 @@ class lora_count_and_sort_expert_tokens_kernel {
         num_experts(num_experts),
         max_num_tokens_padded(max_num_tokens_padded),
         topk_num(topk_num),
-        token_mask(token_mask),
+        token_lora_mapping(token_lora_mapping),
         max_loras(max_loras),
         adapter_enabled(adapter_enabled),
         lora_ids(lora_ids),
@@ -854,15 +856,11 @@ class lora_count_and_sort_expert_tokens_kernel {
     int lora_idx = item.get_group(0);
     int lora_id = lora_ids[lora_idx];
     // Guard against -1 (base-model tokens), out-of-bounds lora_id, and
-    // disabled adapters. token_mask is allocated with torch::empty and left
-    // uninitialized for disabled slots; running the sort here would traverse
-    // garbage bits. Mirrors the fix in vllm-project/vllm#40131.
+    // disabled adapters. Mirrors the fix in vllm-project/vllm#40131.
     if (lora_id == -1 || lora_id >= max_loras ||
         adapter_enabled[lora_id] == 0) {
       return;
     }
-
-    int num_tokens = numel / topk_num;
 
     _count_and_sort_expert_tokens(
         topk_ids,
@@ -872,7 +870,8 @@ class lora_count_and_sort_expert_tokens_kernel {
         numel,
         num_experts,
         max_num_tokens_padded,
-        &token_mask[(lora_id * num_tokens)],
+        token_lora_mapping,
+        lora_id,
         lora_id,
         topk_num,
         has_expert_map,
@@ -898,7 +897,6 @@ class moe_lora_align_block_size_small_batch_expert_kernel {
   int32_t* total_tokens_post_pad;
   const int32_t* adapter_enabled;
   const int32_t* lora_ids;
-  int32_t* token_mask;
   bool has_expert_map;
   sycl::local_accessor<int32_t, 1> slm;
 
@@ -919,7 +917,6 @@ class moe_lora_align_block_size_small_batch_expert_kernel {
       int32_t* total_tokens_post_pad,
       const int32_t* adapter_enabled,
       const int32_t* lora_ids,
-      int32_t* token_mask,
       bool has_expert_map,
       sycl::local_accessor<int32_t, 1> slm)
       : topk_ids(topk_ids),
@@ -937,7 +934,6 @@ class moe_lora_align_block_size_small_batch_expert_kernel {
         total_tokens_post_pad(total_tokens_post_pad),
         adapter_enabled(adapter_enabled),
         lora_ids(lora_ids),
-        token_mask(token_mask),
         has_expert_map(has_expert_map),
         slm(slm) {}
 
@@ -1270,8 +1266,6 @@ void moe_lora_align_block_size(
 
   auto options_int =
       torch::TensorOptions().dtype(torch::kInt).device(topk_ids.device());
-  torch::Tensor token_mask =
-      torch::empty({max_loras * topk_ids.size(0)}, options_int);
   bool has_expert_map = maybe_expert_map.has_value();
   torch::Tensor expert_map;
   if (has_expert_map) {
@@ -1327,7 +1321,6 @@ void moe_lora_align_block_size(
                     num_tokens_post_pad.data_ptr<int32_t>(),
                     adapter_enabled.data_ptr<int32_t>(),
                     lora_ids.data_ptr<int32_t>(),
-                    token_mask.data_ptr<int32_t>(),
                     has_expert_map,
                     slm);
             h.parallel_for(
@@ -1371,7 +1364,6 @@ void moe_lora_align_block_size(
                 vllm::moe::WARP_SIZE,
                 padded_num_experts,
                 lora_ids.data_ptr<int32_t>(),
-                token_mask.data_ptr<int32_t>(),
                 has_expert_map,
                 slm);
             h.parallel_for(
@@ -1404,7 +1396,7 @@ void moe_lora_align_block_size(
                 num_experts,
                 max_num_tokens_padded,
                 topk_num,
-                token_mask.data_ptr<int32_t>(),
+                token_lora_mapping.data_ptr<int32_t>(),
                 max_loras,
                 adapter_enabled.data_ptr<int32_t>(),
                 lora_ids.data_ptr<int32_t>(),
