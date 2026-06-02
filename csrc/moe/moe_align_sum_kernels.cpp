@@ -542,8 +542,8 @@ class moe_align_block_size_kernel {
         cumsum,
         max_num_tokens_padded,
         CEILDIV(max_num_tokens_padded, block_size),
-        0,
-        0,
+        0,   // model_offset
+        -1,  // inactive_expert_id
         topk_num,
         nullptr,
         -1,
@@ -685,8 +685,8 @@ class moe_align_block_size_small_batch_expert_kernel {
         numel,
         max_num_tokens_padded,
         CEILDIV(max_num_tokens_padded, block_size),
-        0,
-        0,
+        -1,  // inactive_expert_id
+        0,   // model_offset
         topk_num,
         nullptr,  // token_lora_mapping: no lora filtering in non-lora path
         -1,       // lora_id_filter: unused when token_lora_mapping is nullptr
