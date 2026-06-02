@@ -287,7 +287,13 @@ void _moe_align_block_size_small_batch_expert(
     int32_t inactive_expert_id,
     int32_t model_offset,
     int32_t topk_num,
-    int32_t* __restrict__ token_mask,
+    // token_lora_mapping and lora_id_filter replace the pre-computed
+    // token_mask array.  Each counting thread reads token_lora_mapping
+    // (a read-only global-memory tensor written before kernel launch)
+    // directly, so no shared-memory synchronization is required.
+    // Pass nullptr / -1 for the non-LoRA path.
+    const int32_t* __restrict__ token_lora_mapping,
+    int32_t lora_id_filter,
     bool has_expert_map,
     sycl::local_accessor<int32_t, 1> slm,
     sycl::nd_item<1> item) {
@@ -334,7 +340,12 @@ void _moe_align_block_size_small_batch_expert(
         // filter invalid expert
         if (expert_id == -1) continue;
       }
-      int mask = token_mask == nullptr ? 1 : token_mask[i / topk_num];
+      int mask = (token_lora_mapping == nullptr)
+                     ? 1
+                     : (static_cast<int32_t>(
+                            token_lora_mapping[i / topk_num]) == lora_id_filter
+                            ? 1
+                            : 0);
       tokens_cnts[(tid + 1) * num_experts + expert_id] += mask;
     }
   }
@@ -392,7 +403,9 @@ void _moe_align_block_size_small_batch_expert(
       int32_t rank_post_pad =
           tokens_cnts[tid * num_experts + expert_id] + cumsum[expert_id];
 
-      if (token_mask == nullptr || token_mask[i / topk_num]) {
+      if (token_lora_mapping == nullptr ||
+          static_cast<int32_t>(token_lora_mapping[i / topk_num]) ==
+              lora_id_filter) {
         sorted_token_ids[sorted_token_ids_offset + rank_post_pad] =
             static_cast<int32_t>(i);
         ++tokens_cnts[tid * num_experts + expert_id];
@@ -665,7 +678,8 @@ class moe_align_block_size_small_batch_expert_kernel {
         0,
         0,
         topk_num,
-        nullptr,
+        nullptr,  // token_lora_mapping: no lora filtering in non-lora path
+        -1,       // lora_id_filter: unused when token_lora_mapping is nullptr
         has_expert_map,
         slm,
         item);
@@ -937,34 +951,12 @@ class moe_lora_align_block_size_small_batch_expert_kernel {
       return;
     }
 
-    int num_tokens = numel / topk_num;
-
-    // Compute pointer to the token_mask region within local shared memory.
-    // slm layout (matching _moe_align_block_size_small_batch_expert):
-    //   [0..num_experts]:              cumsum (num_experts+1 ints)
-    //   [num_experts+1..]:             tokens_cnts ((n_counting+1)*num_experts ints)
-    //   [after tokens_cnts..]:         token_mask_slm (num_tokens ints)
-    // Writing token_mask here (local memory) instead of a global tensor
-    // ensures it is visible to all work-items after a local_space barrier,
-    // avoiding the global-memory visibility issue on Intel XPU.
-    const int32_t n_counting = item.get_local_range(0) - fill_threads;
-    void* slm_raw = static_cast<void*>(
-        slm.template get_multi_ptr<sycl::access::decorated::no>().get());
-    int32_t* slm_ints = reinterpret_cast<int32_t*>(slm_raw);
-    int32_t* token_mask_slm =
-        slm_ints + (num_experts + 1) + (n_counting + 1) * num_experts;
-
-    if (item.get_local_id(0) == 0) {
-      total_tokens_post_pad[lora_id] = 0;
-
-      for (int i = 0; i < num_tokens; i++) {
-        token_mask_slm[i] =
-            static_cast<int>(token_lora_mapping[i]) == lora_id ? 1 : 0;
-      }
-    }
-
-    item.barrier(sycl::access::fence_space::local_space);
-
+    // Pass token_lora_mapping and lora_id directly to the helper so each
+    // counting thread reads the per-token lora assignment from global memory
+    // (a read-only tensor written before kernel launch).  This avoids the
+    // write-then-read race that occurs when thread 0 pre-populates a
+    // shared token_mask and other threads try to read it after a barrier —
+    // a pattern that is unreliable for global memory on Intel XPU.
     _moe_align_block_size_small_batch_expert<scalar_t, fill_threads>(
         topk_ids,
         sorted_token_ids,
@@ -979,7 +971,8 @@ class moe_lora_align_block_size_small_batch_expert_kernel {
         -1,
         lora_id,
         topk_num,
-        token_mask_slm,
+        token_lora_mapping,
+        lora_id,
         has_expert_map,
         slm,
         item);
@@ -1296,13 +1289,8 @@ void moe_lora_align_block_size(
           const int32_t num_thread =
               std::max(static_cast<int32_t>(num_experts), 128);
           // slm layout: cumsum[num_experts+1] + tokens_cnts[(num_thread+1)*num_experts]
-          //             + token_mask_slm[num_tokens_per_lora]
-          // token_mask is placed in local memory so a local_space barrier
-          // is sufficient for visibility across work-items in the work-group.
-          const int32_t num_tokens_per_lora =
-              static_cast<int32_t>(topk_ids.numel()) / topk_num;
           const int32_t shared_mem =
-              ((num_thread + 2) * num_experts + 1 + num_tokens_per_lora) *
+              ((num_thread + 1) * num_experts + (num_experts + 1)) *
               sizeof(int32_t);
 
           if (shared_mem > device_max_shared_mem) {
