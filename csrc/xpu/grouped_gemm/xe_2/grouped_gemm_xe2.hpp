@@ -84,7 +84,8 @@ CUTE_DEVICE void MoEGEMM(
     const int32_t gemm_n,
     const int32_t gemm_k,
     int32_t* atomic_buffer,
-    const sycl::local_accessor<int32_t, 1>& slm_mem_const) {
+    const sycl::local_accessor<int32_t, 1>& slm_mem_const,
+    bool is_block_fp8) {
   constexpr char actual_layout_of_B = LayoutKindB ^ ('R' ^ 'C');
   static constexpr bool is_B_int4 = (std::is_same_v<ElementB, uint8_t>) &&
                                     (!std::is_same_v<ElementS, uint8_t>);
@@ -146,6 +147,13 @@ CUTE_DEVICE void MoEGEMM(
     if constexpr (is_B_4bits) {
       ptr_Scales_curr_batch =
           const_cast<ElementS*>(Scales) + B_offset * 2 / group_size;
+    } else if (is_block_fp8) {
+      // block_fp8 scales: [K//128, N//128] per expert
+      int K_blocks = gemm_k / 128;
+      int N_blocks = gemm_n / 128;
+      ptr_Scales_curr_batch =
+          const_cast<ElementS*>(Scales) +
+          static_cast<int64_t>(expert_id) * K_blocks * N_blocks;
     }
     ElementBI* ptr_Bias_curr_batch = nullptr;
     if (Bias != static_cast<ElementBI*>(nullptr)) {
@@ -194,6 +202,19 @@ CUTE_DEVICE void MoEGEMM(
           XE_GEMM_4BITS_CALLER(256)
         }
 #undef XE_GEMM_4BITS_CALLER
+      } else if (is_block_fp8) {
+        xe_gemm_block_fp8<
+            GmemTiledCopyA,
+            GmemTiledCopyB,
+            GmemTiledCopyD,
+            128>(
+            A_tensor,
+            B_tensor,
+            reinterpret_cast<const float*>(ptr_Scales_curr_batch),
+            ptr_Bias_curr_batch,
+            D_tensor,
+            tile_coord,
+            mma);
       } else {
         xe_gemm<GmemTiledCopyA, GmemTiledCopyB, GmemTiledCopyD>(
             A_tensor,
