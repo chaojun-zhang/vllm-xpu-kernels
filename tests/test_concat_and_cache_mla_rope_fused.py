@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 Tests for fused MLA KV-cache write and RoPE fused kernel.
-Migrated from vllm/tests/kernels/core/test_rotary_embedding_mla_cache_fused.py
 """
 
 import random
@@ -15,8 +14,6 @@ from tests.ops.rotary_embedding_op import RotaryEmbedding
 from tests.register_ops import (concat_and_cache_mla_rope_fused, convert_fp8)
 from tests.utils import opcheck, seed_everything
 
-# For now, disable "test_aot_dispatch_dynamic" since there are some
-# bugs related to this test in PyTorch 2.4.
 DEFAULT_OPCHECK_TEST_UTILS: tuple[str, ...] = (
     "test_schema",
     "test_autograd_registration",

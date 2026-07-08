@@ -2,7 +2,6 @@
 // Fused MLA RoPE + concat-and-cache kernel.
 // Applies RoPE to q_pe (multi-head) and k_pe (single head) in-place, then
 // writes k_pe and kv_c into the paged KV cache.
-// XPU port of vllm/csrc/libtorch_stable/cache_kernels_fused.cu.
 
 #include <sycl/sycl.hpp>
 
