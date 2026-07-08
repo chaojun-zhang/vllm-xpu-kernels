@@ -149,6 +149,18 @@ void concat_and_cache_mla(
     const std::string& kv_cache_dtype,
     torch::Tensor& scale);
 
+void concat_and_cache_mla_rope_fused(
+    torch::Tensor& positions,
+    torch::Tensor& q_pe,
+    torch::Tensor& k_pe,
+    torch::Tensor& kv_c,
+    torch::Tensor& rope_cos_sin_cache,
+    bool rope_is_neox,
+    torch::Tensor& slot_mapping,
+    torch::Tensor& kv_cache,
+    const std::string& kv_cache_dtype,
+    torch::Tensor& kv_cache_quant_scale);
+
 void gather_cache(
     torch::Tensor const& src_cache,    // [NUM_BLOCKS, BLOCK_SIZE, ENTRIES...]
     torch::Tensor const& dst,          // [TOT_TOKENS, ENTRIES...]

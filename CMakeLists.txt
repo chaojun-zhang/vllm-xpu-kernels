@@ -532,6 +532,7 @@ if(BASIC_KERNELS_ENABLED)
   message(STATUS "Enabling C extension.")
   set(VLLM_EXT_SRC
       "csrc/cache.cpp"
+      "csrc/cache_fused.cpp"
       "csrc/layernorm.cpp"
       "csrc/layernorm_quant.cpp"
       "csrc/activation.cpp"

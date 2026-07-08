@@ -213,6 +213,23 @@ def concat_and_cache_mla(
                                                 scale)
 
 
+def concat_and_cache_mla_rope_fused(
+    positions: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_c: torch.Tensor,
+    rope_cos_sin_cache: torch.Tensor,
+    rope_is_neox: bool,
+    slot_mapping: torch.Tensor,
+    kv_cache: torch.Tensor,
+    kv_cache_dtype: str,
+    kv_cache_quant_scale: torch.Tensor,
+) -> None:
+    torch.ops._C_cache_ops.concat_and_cache_mla_rope_fused(
+        positions, q_pe, k_pe, kv_c, rope_cos_sin_cache, rope_is_neox,
+        slot_mapping, kv_cache, kv_cache_dtype, kv_cache_quant_scale)
+
+
 def gather_cache(src_cache: torch.Tensor,
                  dst: torch.Tensor,
                  block_table: torch.Tensor,

@@ -271,6 +271,17 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "                     Tensor scale) -> ()");
   cache_ops.impl("concat_and_cache_mla", torch::kXPU, &concat_and_cache_mla);
 
+  // Fused RoPE + concat-and-cache for MLA.
+  cache_ops.def(
+      "concat_and_cache_mla_rope_fused("
+      "Tensor positions, Tensor! q_pe, Tensor! k_pe,"
+      "Tensor kv_c, Tensor rope_cos_sin_cache,"
+      "bool rope_is_neox, Tensor slot_mapping,"
+      "Tensor! kv_cache, str kv_cache_dtype,"
+      "Tensor kv_cache_quant_scale) -> ()");
+  cache_ops.impl("concat_and_cache_mla_rope_fused", torch::kXPU,
+                 &concat_and_cache_mla_rope_fused);
+
   // Gather cache blocks from src_cache to dst.
   cache_ops.def(
       "gather_cache(Tensor src_cache, Tensor! dst, Tensor block_table, "
