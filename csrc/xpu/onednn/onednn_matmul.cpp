@@ -80,12 +80,12 @@ void check_fp8_gemm_output_tensor(
       "output must be float16 or bfloat16 for fp8 matmul");
   TORCH_CHECK(
       out.device() == A.device(),
-      "fp8_gemm_out output and input must be on the same device");
+      "fp8_gemm output and input must be on the same device");
 
   if (A.dim() == 2) {
     TORCH_CHECK(
         out.dim() == 2 && out.size(0) == A.size(0) && out.size(1) == B.size(1),
-        "fp8_gemm_out output shape mismatch, expected [",
+        "fp8_gemm output shape mismatch, expected [",
         A.size(0),
         ", ",
         B.size(1),
@@ -95,7 +95,7 @@ void check_fp8_gemm_output_tensor(
     TORCH_CHECK(
         out.dim() == 3 && out.size(0) == A.size(0) &&
             out.size(1) == A.size(1) && out.size(2) == B.size(1),
-        "fp8_gemm_out output shape mismatch, expected [",
+        "fp8_gemm output shape mismatch, expected [",
         A.size(0),
         ", ",
         A.size(1),
@@ -112,7 +112,8 @@ torch::Tensor fp8_gemm(
     std::optional<c10::ScalarType> out_dtype,
     const std::optional<torch::Tensor>& A_scale_,
     const std::optional<torch::Tensor>& B_scale_,
-    const std::optional<torch::Tensor>& bias_) {
+    const std::optional<torch::Tensor>& bias_,
+    std::optional<torch::Tensor> out) {
   const at::DeviceGuard device_guard(A.device());
   // The weight B may be provided in a transposed (NT) layout, and A supports
   // strided layouts, so both are excluded from the contiguity check.
@@ -125,7 +126,15 @@ torch::Tensor fp8_gemm(
   TORCH_CHECK(
       !bias_.has_value() || bias_.value().is_contiguous(),
       "bias must be contiguous for fp8 matmul");
-  torch::Tensor result = check_and_create_output_tensor(A, B, out_dtype);
+  torch::Tensor result;
+  if (out.has_value()) {
+    // Write in place into the caller-provided buffer (formerly the
+    // dedicated fp8_gemm_out op) instead of allocating a new output.
+    check_fp8_gemm_output_tensor(out.value(), A, B);
+    result = out.value();
+  } else {
+    result = check_and_create_output_tensor(A, B, out_dtype);
+  }
   auto a_st = A.scalar_type();
   auto b_st = B.scalar_type();
   TORCH_CHECK(
@@ -178,27 +187,6 @@ torch::Tensor fp8_bmm(
   oneDNN::dnnl_batch_matmul_w8a8_fp8(
       result, A, B, is_nt, bias_, A_scale, B_scale);
   return result;
-}
-
-void fp8_gemm_out(
-    torch::Tensor& out,
-    const torch::Tensor& A,
-    const torch::Tensor& B,
-    const std::optional<torch::Tensor>& A_scale_,
-    const std::optional<torch::Tensor>& B_scale_,
-    const std::optional<torch::Tensor>& bias_) {
-  const at::DeviceGuard device_guard(A.device());
-  check_fp8_gemm_output_tensor(out, A, B);
-  auto a_st = A.scalar_type();
-  auto b_st = B.scalar_type();
-  TORCH_CHECK(
-      is_supported_fp8(a_st) && is_supported_fp8(b_st) && a_st == b_st,
-      "input and weight must be f8_e5m2 or f8_e4m3fn for fp8 matmul");
-  bool is_nt = B.strides()[B.dim() - 2] == 1;
-
-  torch::Tensor A_scale = A_scale_.value_or(at::ones({1}, torch::kFloat));
-  torch::Tensor B_scale = B_scale_.value_or(at::ones({1}, torch::kFloat));
-  oneDNN::dnnl_matmul_w8a8_fp8(out, A, B, is_nt, bias_, A_scale, B_scale);
 }
 
 torch::Tensor fp8_gemm_w8a16(

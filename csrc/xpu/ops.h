@@ -10,26 +10,24 @@
  * a packed representation with 8 int4 values packed into one byte along the k
  * dimension.
  */
+// If `out` is given, the result is written in place into it (its dtype,
+// shape and device must already match A/B) and `out` itself is returned;
+// otherwise a new output tensor is allocated using `out_dtype` (defaulting
+// to fp16) and returned. This merges the former fp8_gemm/fp8_gemm_out ops
+// into a single op.
 torch::Tensor fp8_gemm(
     const torch::Tensor& A,
     const torch::Tensor& B,
     std::optional<c10::ScalarType> out_dtype,
     const std::optional<torch::Tensor>& A_scale_,
     const std::optional<torch::Tensor>& B_scale_,
-    const std::optional<torch::Tensor>& bias_);
+    const std::optional<torch::Tensor>& bias_,
+    std::optional<torch::Tensor> out = std::nullopt);
 
 torch::Tensor fp8_bmm(
     const torch::Tensor& A,
     const torch::Tensor& B,
     std::optional<c10::ScalarType> out_dtype,
-    const std::optional<torch::Tensor>& A_scale_,
-    const std::optional<torch::Tensor>& B_scale_,
-    const std::optional<torch::Tensor>& bias_);
-
-void fp8_gemm_out(
-    torch::Tensor& out,
-    const torch::Tensor& A,
-    const torch::Tensor& B,
     const std::optional<torch::Tensor>& A_scale_,
     const std::optional<torch::Tensor>& B_scale_,
     const std::optional<torch::Tensor>& bias_);

@@ -11,20 +11,18 @@
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, xpu_ops) {
   at::Tag stride_tag = at::Tag::needs_fixed_stride_order;
 
+  // fp8_gemm's `out` argument merges the former standalone fp8_gemm_out op:
+  // when given, the result is written in place into it and returned;
+  // otherwise a new output tensor is allocated using `out_dtype`.
   xpu_ops.def(
       "fp8_gemm(Tensor A, Tensor B, ScalarType? out_dtype, Tensor? A_scale_, "
-      "Tensor? B_scale_, Tensor? bias_) -> Tensor");
+      "Tensor? B_scale_, Tensor? bias_, Tensor(a!)? out=None) -> Tensor");
   xpu_ops.impl("fp8_gemm", torch::kXPU, &fp8_gemm);
 
   xpu_ops.def(
       "fp8_bmm(Tensor A, Tensor B, ScalarType? out_dtype, Tensor? A_scale_, "
       "Tensor? B_scale_, Tensor? bias_) -> Tensor");
   xpu_ops.impl("fp8_bmm", torch::kXPU, &fp8_bmm);
-
-  xpu_ops.def(
-      "fp8_gemm_out(Tensor(a!) out, Tensor A, Tensor B, Tensor? A_scale_, "
-      "Tensor? B_scale_, Tensor? bias_) -> ()");
-  xpu_ops.impl("fp8_gemm_out", torch::kXPU, &fp8_gemm_out);
 
   xpu_ops.def(
       "fp8_gemm_w8a16(Tensor A, Tensor B, Tensor? B_scale_, "

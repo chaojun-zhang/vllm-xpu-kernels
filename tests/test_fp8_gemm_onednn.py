@@ -7,7 +7,7 @@ from tests.ops.fp8_quant_op import (fp8_block_dequant_2d, fp8_block_quant_2d,
                                     per_token_group_quant_fp8,
                                     scaled_fp8_quant)
 from tests.ops.mx_utils import from_blocked_format, to_mxfp
-from tests.register_ops import fp8_bmm, fp8_gemm,fpgemm_out, fp8_gemm_w8a16
+from tests.register_ops import fp8_bmm, fp8_gemm, fp8_gemm_w8a16
 
 BATCHES = [1, 2, 8]
 OUT_DTYPES = [torch.float16, torch.bfloat16]
@@ -180,7 +180,7 @@ def test_fp8_gemm_per_tensor(fp8_dtype, out_dtype, is_nt, batch, mnk_factors):
 @pytest.mark.parametrize("is_nt", [True, False])
 @pytest.mark.parametrize("batch", [1])
 @pytest.mark.parametrize("mnk_factors", MINI_MNK_FACTORS)
-def test_fp8_gemm_out_per_tensor(fp8_dtype, out_dtype, is_nt, batch,
+def test_fp8_gemm_out_arg_per_tensor(fp8_dtype, out_dtype, is_nt, batch,
                                  mnk_factors):
     seed = 1234
     torch.manual_seed(seed)
@@ -204,8 +204,8 @@ def test_fp8_gemm_out_per_tensor(fp8_dtype, out_dtype, is_nt, batch,
         weight_fp8 = weight_fp8.contiguous()
 
     output = torch.empty((batch * m, n), dtype=out_dtype, device="xpu")
-    fp8_gemm_out(output, input_fp8, weight_fp8, scale_src, scale_wei,
-                 torch.Tensor())
+    fp8_gemm(input_fp8, weight_fp8, out_dtype, scale_src, scale_wei,
+             torch.Tensor(), out=output)
 
     output_ref = fp8_gemm(input_fp8, weight_fp8, out_dtype, scale_src,
                           scale_wei, torch.Tensor())

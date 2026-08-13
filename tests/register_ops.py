@@ -75,46 +75,6 @@ def silu_and_mul_per_block_quant(
     return out, scales
 
 
-def silu_and_mul_per_block_quant(
-    input: torch.Tensor,
-    group_size: int,
-    quant_dtype: torch.dtype,
-    scale_ub: Optional[torch.Tensor] = None,
-    is_scale_transposed: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused SiLU+Mul + per-group dynamic quantization.
-
-    Args:
-        input: [num_tokens, hidden_size * 2]  (gate || up layout)
-        group_size: column group size (64 or 128)
-        quant_dtype: output dtype (float8_e4m3fn, float8_e5m2, or int8)
-        scale_ub: optional scale upper-bound for FP8 output
-        is_scale_transposed: if True, scales are stored as
-            [num_groups, num_tokens] (column-major) rather than row-major
-
-    Returns:
-        (out, scales): out [num_tokens, hidden_size] in quant_dtype,
-                       scales [num_tokens, num_groups] (logical shape)
-    """
-    assert input.ndim == 2
-    num_tokens = input.shape[0]
-    hidden_size = input.shape[-1] // 2
-    num_groups = hidden_size // group_size
-
-    out = torch.empty((num_tokens, hidden_size), device=input.device,
-                      dtype=quant_dtype)
-    if is_scale_transposed:
-        scales = torch.empty((num_groups, num_tokens), device=input.device,
-                             dtype=torch.float32).t()
-    else:
-        scales = torch.empty((num_tokens, num_groups), device=input.device,
-                             dtype=torch.float32)
-
-    torch.ops._C.silu_and_mul_per_block_quant(
-        out, input, scales, group_size, scale_ub, is_scale_transposed)
-    return out, scales
-
-
 def gelu_fast(out: torch.Tensor, input: torch.Tensor) -> None:
     torch.ops._C.gelu_fast(out, input)
 
@@ -445,17 +405,14 @@ def fp8_gemm(input: torch.Tensor, weight: torch.Tensor,
              out_dtype: Optional[torch.dtype],
              scale_act: Optional[torch.Tensor],
              scale_wei: Optional[torch.Tensor],
-             bias: Optional[torch.Tensor] = None):
+             bias: Optional[torch.Tensor] = None,
+             out: Optional[torch.Tensor] = None):
+    """fp8 (w8a8) GEMM. If `out` is given, the result is written in place
+    into it (its dtype/shape/device must already match) and `out` is
+    returned; otherwise a new output tensor is allocated using `out_dtype`.
+    This subsumes the former standalone fp8_gemm_out op."""
     return torch.ops._xpu_C.fp8_gemm(input, weight, out_dtype, scale_act,
-                                      scale_wei, bias)
-
-
-def fp8_gemm_out(out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor,
-                 scale_act: Optional[torch.Tensor],
-                 scale_wei: Optional[torch.Tensor],
-                 bias: Optional[torch.Tensor] = None):
-    return torch.ops._xpu_C.fp8_gemm_out(out, input, weight, scale_act,
-                                         scale_wei, bias)
+                                     scale_wei, bias, out)
 
 
 def fp8_bmm(input: torch.Tensor, weight: torch.Tensor,
