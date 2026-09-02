@@ -73,6 +73,13 @@ static inline void dnnl_matmul_w4a4_fp4(
   auto f_attr = [&](dnnl::primitive_attr& pattr) {
     pattr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
+    // An mxfp4 group scaled by 2**14 or more overflows f16 once it is applied
+    // to the E2M1 maximum of 6 (2**14 * 6 > 65504), which makes the whole
+    // output NaN. Models with massive activations (Qwen3 MLP down_proj inputs
+    // reach ~2e5) hit this, so keep the scaled values in f32.
+    pattr.set_fpmath_mode(dnnl::fpmath_mode::f32, true);
+    pattr.set_accumulation_mode(dnnl::accumulation_mode::f32);
+
     if (m1_sc_dtype == at::ScalarType::Float8_e8m0fnu) {
       pattr.set_scales(
           DNNL_ARG_SRC,
