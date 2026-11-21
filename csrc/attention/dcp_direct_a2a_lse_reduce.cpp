@@ -17,6 +17,9 @@
 #include "utils.h"
 
 namespace vllm {
+// TEMPORARY DEBUG: remove before merging.
+#define DCP_A2A_DEBUG 1
+
 namespace direct_dcp {
 
 constexpr uint64_t kSpinLimit = 100000000;
@@ -70,7 +73,20 @@ inline int64_t find_sequence(
 
 struct IncrementEpoch {
   int64_t* epoch;
-  void operator()(sycl::nd_item<1>) const { epoch[0] += 1; }
+  int64_t rank;
+  void operator()(sycl::nd_item<1>) const {
+#ifdef DCP_A2A_DEBUG
+    const int64_t old_epoch = epoch[0];
+#endif
+    epoch[0] += 1;
+#ifdef DCP_A2A_DEBUG
+    sycl::ext::oneapi::experimental::printf(
+        "[a2a dbg] rank=%ld IncrementEpoch %ld -> %ld\n",
+        static_cast<long>(rank),
+        static_cast<long>(old_epoch),
+        static_cast<long>(epoch[0]));
+#endif
+  }
 };
 
 template <typename lse_t>
@@ -194,6 +210,14 @@ struct SignalPeers {
     const int64_t parity = static_cast<int64_t>(epoch & 1u);
     auto* peer_signal = get_peer_ptr<uint32_t>(peer_signal_ptrs, destination_rank);
     store_release_system(peer_signal + parity * world_size + rank, epoch);
+#ifdef DCP_A2A_DEBUG
+    sycl::ext::oneapi::experimental::printf(
+        "[a2a dbg] rank=%ld SignalPeers dst=%ld epoch=%u parity=%ld\n",
+        static_cast<long>(rank),
+        static_cast<long>(destination_rank),
+        epoch,
+        static_cast<long>(parity));
+#endif
   }
 };
 
@@ -245,6 +269,19 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
                 heads_per_rank_ +
             head_idx;
         if (!wait_for_epoch(received_signal_ + parity * world_size_ + src, epoch)) {
+#ifdef DCP_A2A_DEBUG
+          if (token_idx == 0 && head_idx == 0) {
+            sycl::ext::oneapi::experimental::printf(
+                "[a2a dbg] TIMEOUT src=%ld want_epoch=%u parity=%ld "
+                "sig[p0]=%u sig[p1]=%u epoch_now=%ld\n",
+                static_cast<long>(src),
+                epoch,
+                static_cast<long>(parity),
+                load_acquire_system(received_signal_ + src),
+                load_acquire_system(received_signal_ + world_size_ + src),
+                static_cast<long>(epoch_ptr_[0]));
+          }
+#endif
           sycl::ext::oneapi::experimental::printf(
               "direct DCP A2A timeout source=%ld token=%ld head=%ld epoch=%u\n",
               static_cast<long>(src),
@@ -439,7 +476,7 @@ void direct_dcp_a2a_lse_reduce(
   constexpr int64_t kCombineThreads = 128;
   int64_t* epoch_ptr = epoch.data_ptr<int64_t>();
 
-  vllm::xpu::sycl_kernel_submit(queue, 1, 1, IncrementEpoch{epoch_ptr});
+  vllm::xpu::sycl_kernel_submit(queue, 1, 1, IncrementEpoch{epoch_ptr, rank});
 
   auto launch_dispatch = [&](auto lse_tag) {
     using lse_t = decltype(lse_tag);
