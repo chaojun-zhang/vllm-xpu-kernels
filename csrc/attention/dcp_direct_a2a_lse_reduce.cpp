@@ -9,6 +9,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <sycl/sycl.hpp>
@@ -17,13 +18,67 @@
 #include "utils.h"
 
 namespace vllm {
-// TEMPORARY DEBUG: remove before merging.
+// TEMPORARY DEBUG: remove before merging. Records kernel events into a
+// host-pinned ring so a hung run can be inspected from the host.
 #define DCP_A2A_DEBUG 1
 
 namespace direct_dcp {
 
 constexpr uint64_t kSpinLimit = 100000000;
 constexpr float kLog2E = 1.4426950408889634f;
+
+constexpr int64_t kTraceRecords = 1 << 16;
+constexpr int64_t kTraceFields = 8;
+// Event kinds: 1 IncrementEpoch(old,new) 2 SignalPeers(dst,epoch,parity)
+// 3 WaitBegin(src,want,sig0,sig1) 4 WaitOk(src,want)
+// 5 WaitSpin(src,want,cur) 6 WaitTimeout(src,want,sig0,sig1)
+
+using trace_ref_t = sycl::atomic_ref<
+    int64_t,
+    sycl::memory_order::relaxed,
+    sycl::memory_scope::system,
+    sycl::access::address_space::global_space>;
+
+inline void trace(
+    int64_t* buf,
+    int64_t kind,
+    int64_t a = 0,
+    int64_t b = 0,
+    int64_t c = 0,
+    int64_t d = 0) {
+#ifdef DCP_A2A_DEBUG
+  if (buf == nullptr) {
+    return;
+  }
+  trace_ref_t counter(buf[0]);
+  const int64_t idx = counter.fetch_add(1);
+  if (idx >= kTraceRecords) {
+    return;
+  }
+  int64_t* rec = buf + kTraceFields + idx * kTraceFields;
+  rec[2] = a;
+  rec[3] = b;
+  rec[4] = c;
+  rec[5] = d;
+  rec[7] = idx;
+  trace_ref_t(rec[0]).store(
+      kind, sycl::memory_order::release, sycl::memory_scope::system);
+#endif
+}
+
+int64_t* trace_buffer(sycl::queue& queue) {
+#ifdef DCP_A2A_DEBUG
+  static int64_t* buf = [&] {
+    const size_t n = kTraceFields * (kTraceRecords + 1);
+    auto* ptr = sycl::malloc_host<int64_t>(n, queue);
+    std::memset(ptr, 0, n * sizeof(int64_t));
+    return ptr;
+  }();
+  return buf;
+#else
+  return nullptr;
+#endif
+}
 
 using signal_ref_t = sycl::atomic_ref<
     uint32_t,
@@ -47,10 +102,15 @@ inline uint32_t load_acquire_system(const uint32_t* ptr) {
   return ref.load(sycl::memory_order::acquire, sycl::memory_scope::system);
 }
 
-inline bool wait_for_epoch(const uint32_t* ptr, uint32_t epoch) {
+inline bool wait_for_epoch(
+    const uint32_t* ptr, uint32_t epoch, int64_t* trace_buf, int64_t src) {
   for (uint64_t spins = 0; spins < kSpinLimit; ++spins) {
-    if (load_acquire_system(ptr) == epoch) {
+    const uint32_t cur = load_acquire_system(ptr);
+    if (cur == epoch) {
       return true;
+    }
+    if (trace_buf != nullptr && spins != 0 && (spins & 0x3fffff) == 0) {
+      trace(trace_buf, 5, src, epoch, cur);
     }
   }
   return false;
@@ -73,19 +133,11 @@ inline int64_t find_sequence(
 
 struct IncrementEpoch {
   int64_t* epoch;
-  int64_t rank;
+  int64_t* trace_buf;
   void operator()(sycl::nd_item<1>) const {
-#ifdef DCP_A2A_DEBUG
     const int64_t old_epoch = epoch[0];
-#endif
     epoch[0] += 1;
-#ifdef DCP_A2A_DEBUG
-    sycl::ext::oneapi::experimental::printf(
-        "[a2a dbg] rank=%ld IncrementEpoch %ld -> %ld\n",
-        static_cast<long>(rank),
-        static_cast<long>(old_epoch),
-        static_cast<long>(epoch[0]));
-#endif
+    trace(trace_buf, 1, old_epoch, epoch[0]);
   }
 };
 
@@ -196,6 +248,7 @@ class DispatchOutputLse : public xpu::SyclKernelConfigConvention {
 };
 
 struct SignalPeers {
+  int64_t* trace_buf;
   const uint64_t* peer_signal_ptrs;
   const int64_t* epoch_ptr;
   int64_t world_size;
@@ -210,14 +263,7 @@ struct SignalPeers {
     const int64_t parity = static_cast<int64_t>(epoch & 1u);
     auto* peer_signal = get_peer_ptr<uint32_t>(peer_signal_ptrs, destination_rank);
     store_release_system(peer_signal + parity * world_size + rank, epoch);
-#ifdef DCP_A2A_DEBUG
-    sycl::ext::oneapi::experimental::printf(
-        "[a2a dbg] rank=%ld SignalPeers dst=%ld epoch=%u parity=%ld\n",
-        static_cast<long>(rank),
-        static_cast<long>(destination_rank),
-        epoch,
-        static_cast<long>(parity));
-#endif
+    trace(trace_buf, 2, destination_rank, epoch, parity);
   }
 };
 
@@ -234,8 +280,10 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
       int64_t max_num_tokens,
       int64_t heads_per_rank,
       int64_t head_dim,
-      bool is_lse_base_on_e)
-      : received_output_(received_output),
+      bool is_lse_base_on_e,
+      int64_t* trace_buf)
+      : trace_buf_(trace_buf),
+        received_output_(received_output),
         received_lse_(received_lse),
         received_signal_(received_signal),
         epoch_ptr_(epoch_ptr),
@@ -268,20 +316,27 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
             ((parity * world_size_ + src) * max_num_tokens_ + token_idx) *
                 heads_per_rank_ +
             head_idx;
-        if (!wait_for_epoch(received_signal_ + parity * world_size_ + src, epoch)) {
-#ifdef DCP_A2A_DEBUG
-          if (token_idx == 0 && head_idx == 0) {
-            sycl::ext::oneapi::experimental::printf(
-                "[a2a dbg] TIMEOUT src=%ld want_epoch=%u parity=%ld "
-                "sig[p0]=%u sig[p1]=%u epoch_now=%ld\n",
-                static_cast<long>(src),
+        const bool traced = token_idx == 0 && head_idx == 0;
+        int64_t* tb = traced ? trace_buf_ : nullptr;
+        trace(
+            tb,
+            3,
+            src,
+            epoch,
+            load_acquire_system(received_signal_ + src),
+            load_acquire_system(received_signal_ + world_size_ + src));
+        if (!wait_for_epoch(
+                received_signal_ + parity * world_size_ + src,
                 epoch,
-                static_cast<long>(parity),
-                load_acquire_system(received_signal_ + src),
-                load_acquire_system(received_signal_ + world_size_ + src),
-                static_cast<long>(epoch_ptr_[0]));
-          }
-#endif
+                tb,
+                src)) {
+          trace(
+              tb,
+              6,
+              src,
+              epoch,
+              load_acquire_system(received_signal_ + src),
+              load_acquire_system(received_signal_ + world_size_ + src));
           sycl::ext::oneapi::experimental::printf(
               "direct DCP A2A timeout source=%ld token=%ld head=%ld epoch=%u\n",
               static_cast<long>(src),
@@ -291,6 +346,7 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
           timed_out = true;
           break;
         }
+        trace(tb, 4, src, epoch);
         float value = received_lse_[source_item];
         if (sycl::isnan(value) || value == inf) {
           value = -inf;
@@ -343,6 +399,7 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
   }
 
  private:
+  int64_t* trace_buf_;
   const scalar_t* received_output_;
   const float* received_lse_;
   const uint32_t* received_signal_;
@@ -476,7 +533,8 @@ void direct_dcp_a2a_lse_reduce(
   constexpr int64_t kCombineThreads = 128;
   int64_t* epoch_ptr = epoch.data_ptr<int64_t>();
 
-  vllm::xpu::sycl_kernel_submit(queue, 1, 1, IncrementEpoch{epoch_ptr, rank});
+  int64_t* trace_buf = trace_buffer(queue);
+  vllm::xpu::sycl_kernel_submit(queue, 1, 1, IncrementEpoch{epoch_ptr, trace_buf});
 
   auto launch_dispatch = [&](auto lse_tag) {
     using lse_t = decltype(lse_tag);
@@ -517,7 +575,7 @@ void direct_dcp_a2a_lse_reduce(
       queue,
       signal_groups * kExchangeThreads,
       kExchangeThreads,
-      SignalPeers{signal_ptrs, epoch_ptr, world_size, rank});
+      SignalPeers{trace_buf, signal_ptrs, epoch_ptr, world_size, rank});
 
   auto launch_combine = [&](auto scalar_tag) {
     using scalar_t = decltype(scalar_tag);
@@ -536,11 +594,26 @@ void direct_dcp_a2a_lse_reduce(
             max_num_tokens,
             heads_per_rank,
             head_dim,
-            is_lse_base_on_e));
+            is_lse_base_on_e,
+            trace_buf));
   };
   if (output_dtype == at::kBFloat16) {
     launch_combine(sycl::ext::oneapi::bfloat16{});
   } else {
     launch_combine(sycl::half{});
   }
+}
+
+// TEMPORARY DEBUG: alias of the host-pinned trace ring (int64 CPU tensor).
+// Element 0 is the record counter; records are 8 int64 starting at index 8.
+at::Tensor direct_dcp_a2a_trace(bool reset) {
+  auto& queue = vllm::xpu::vllmGetQueue();
+  int64_t* buf = vllm::direct_dcp::trace_buffer(queue);
+  TORCH_CHECK(buf != nullptr, "DCP_A2A_DEBUG is not enabled");
+  const int64_t n = vllm::direct_dcp::kTraceFields *
+                    (vllm::direct_dcp::kTraceRecords + 1);
+  if (reset) {
+    std::memset(buf, 0, n * sizeof(int64_t));
+  }
+  return torch::from_blob(buf, {n}, torch::kInt64);
 }
