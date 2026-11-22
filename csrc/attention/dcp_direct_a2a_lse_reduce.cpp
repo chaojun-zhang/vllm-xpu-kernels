@@ -345,27 +345,32 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
             head_idx;
         const bool traced = token_idx == 0 && head_idx == 0;
         int64_t* tb = traced ? trace_buf_ : nullptr;
-        trace(
-            tb,
-            3,
-            src,
-            epoch,
-            load_acquire_system(received_signal_ + src * signal_stride_),
-            load_acquire_system(
-                received_signal_ + (world_size_ + src) * signal_stride_));
-        if (!wait_for_epoch(
-                received_signal_ + (parity * world_size_ + src) * signal_stride_,
-                epoch,
-                tb,
-                src)) {
+        // Guarded so the extra system loads only run when tracing.
+        if (tb != nullptr) {
           trace(
               tb,
-              6,
+              3,
               src,
               epoch,
               load_acquire_system(received_signal_ + src * signal_stride_),
               load_acquire_system(
                   received_signal_ + (world_size_ + src) * signal_stride_));
+        }
+        if (!wait_for_epoch(
+                received_signal_ + (parity * world_size_ + src) * signal_stride_,
+                epoch,
+                tb,
+                src)) {
+          if (tb != nullptr) {
+            trace(
+                tb,
+                6,
+                src,
+                epoch,
+                load_acquire_system(received_signal_ + src * signal_stride_),
+                load_acquire_system(
+                    received_signal_ + (world_size_ + src) * signal_stride_));
+          }
           sycl::ext::oneapi::experimental::printf(
               "direct DCP A2A timeout source=%ld token=%ld head=%ld epoch=%u\n",
               static_cast<long>(src),
