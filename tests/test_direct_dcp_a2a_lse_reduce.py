@@ -17,6 +17,8 @@ import vllm_xpu_kernels._C  # noqa: F401
 
 HEADS_PER_RANK = 6
 HEAD_DIM = 64
+# One 128B cache line per signal slot; the kernel infers it from the size.
+SIGNAL_STRIDE = 32
 MAX_NUM_TOKENS = 32
 WORKER_TIMEOUT_S = 90
 
@@ -60,7 +62,7 @@ class _Workspace:
                         HEAD_DIM), dtype),
             "lse": ((2, world_size, MAX_NUM_TOKENS, HEADS_PER_RANK),
                     torch.float32),
-            "signal": ((2, world_size), torch.int32),
+            "signal": ((2, world_size, SIGNAL_STRIDE), torch.int32),
         }
         for name, (shape, dt) in shapes.items():
             storage = symm_mem.empty(shape, device=device, dtype=dt)

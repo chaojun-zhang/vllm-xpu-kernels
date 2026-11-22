@@ -253,6 +253,7 @@ struct SignalPeers {
   const int64_t* epoch_ptr;
   int64_t world_size;
   int64_t rank;
+  int64_t signal_stride;
 
   void operator()(sycl::nd_item<1> item) const {
     const int64_t destination_rank = item.get_global_id(0);
@@ -262,7 +263,8 @@ struct SignalPeers {
     const uint32_t epoch = static_cast<uint32_t>(epoch_ptr[0]);
     const int64_t parity = static_cast<int64_t>(epoch & 1u);
     auto* peer_signal = get_peer_ptr<uint32_t>(peer_signal_ptrs, destination_rank);
-    store_release_system(peer_signal + parity * world_size + rank, epoch);
+    store_release_system(
+        peer_signal + (parity * world_size + rank) * signal_stride, epoch);
     trace(trace_buf, 2, destination_rank, epoch, parity);
   }
 };
@@ -281,8 +283,10 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
       int64_t heads_per_rank,
       int64_t head_dim,
       bool is_lse_base_on_e,
+      int64_t signal_stride,
       int64_t* trace_buf)
-      : trace_buf_(trace_buf),
+      : signal_stride_(signal_stride),
+        trace_buf_(trace_buf),
         received_output_(received_output),
         received_lse_(received_lse),
         received_signal_(received_signal),
@@ -323,10 +327,11 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
             3,
             src,
             epoch,
-            load_acquire_system(received_signal_ + src),
-            load_acquire_system(received_signal_ + world_size_ + src));
+            load_acquire_system(received_signal_ + src * signal_stride_),
+            load_acquire_system(
+                received_signal_ + (world_size_ + src) * signal_stride_));
         if (!wait_for_epoch(
-                received_signal_ + parity * world_size_ + src,
+                received_signal_ + (parity * world_size_ + src) * signal_stride_,
                 epoch,
                 tb,
                 src)) {
@@ -335,8 +340,9 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
               6,
               src,
               epoch,
-              load_acquire_system(received_signal_ + src),
-              load_acquire_system(received_signal_ + world_size_ + src));
+              load_acquire_system(received_signal_ + src * signal_stride_),
+              load_acquire_system(
+                  received_signal_ + (world_size_ + src) * signal_stride_));
           sycl::ext::oneapi::experimental::printf(
               "direct DCP A2A timeout source=%ld token=%ld head=%ld epoch=%u\n",
               static_cast<long>(src),
@@ -399,6 +405,7 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
   }
 
  private:
+  int64_t signal_stride_;
   int64_t* trace_buf_;
   const scalar_t* received_output_;
   const float* received_lse_;
@@ -496,6 +503,14 @@ void direct_dcp_a2a_lse_reduce(
           received_lse.scalar_type() == at::kFloat &&
           received_signal.scalar_type() == at::kInt,
       "invalid symmetric staging dtypes");
+  // Signal slots may be padded (one cache line each) so that writers on
+  // different devices never share a line; the stride is inferred from size.
+  const int64_t signal_slots = 2 * world_size;
+  TORCH_CHECK(
+      received_signal.numel() >= signal_slots &&
+          received_signal.numel() % signal_slots == 0,
+      "received_signal must hold a multiple of 2 * world_size elements");
+  const int64_t signal_stride = received_signal.numel() / signal_slots;
   TORCH_CHECK(
       epoch.scalar_type() == at::kLong && epoch.numel() >= 1,
       "epoch must be an int64 tensor");
@@ -575,7 +590,8 @@ void direct_dcp_a2a_lse_reduce(
       queue,
       signal_groups * kExchangeThreads,
       kExchangeThreads,
-      SignalPeers{trace_buf, signal_ptrs, epoch_ptr, world_size, rank});
+      SignalPeers{
+          trace_buf, signal_ptrs, epoch_ptr, world_size, rank, signal_stride});
 
   auto launch_combine = [&](auto scalar_tag) {
     using scalar_t = decltype(scalar_tag);
@@ -595,6 +611,7 @@ void direct_dcp_a2a_lse_reduce(
             heads_per_rank,
             head_dim,
             is_lse_base_on_e,
+            signal_stride,
             trace_buf));
   };
   if (output_dtype == at::kBFloat16) {
