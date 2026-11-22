@@ -9,6 +9,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -106,10 +107,57 @@ inline uint32_t load_acquire_system(const uint32_t* ptr) {
   return ref.load(sycl::memory_order::acquire, sycl::memory_scope::system);
 }
 
+// TEMPORARY EXPERIMENT: runtime-selectable signal publish/observe variants,
+// chosen via DCP_A2A_SIGNAL_MODE / DCP_A2A_WAIT_MODE to locate the
+// lost-signal hang with a single build.
+//   signal: 0 release store, 1 release store + seq_cst system fence,
+//           2 release exchange, 3 release fetch_max
+//   wait:   0 acquire load, 1 acquire fetch_or(0)
+inline void publish_signal(uint32_t* ptr, uint32_t value, int32_t mode) {
+  signal_ref_t ref(*ptr);
+  switch (mode) {
+    case 1:
+      ref.store(
+          value, sycl::memory_order::release, sycl::memory_scope::system);
+      sycl::atomic_fence(
+          sycl::memory_order::seq_cst, sycl::memory_scope::system);
+      break;
+    case 2:
+      ref.exchange(
+          value, sycl::memory_order::release, sycl::memory_scope::system);
+      break;
+    case 3:
+      ref.fetch_max(
+          value, sycl::memory_order::release, sycl::memory_scope::system);
+      break;
+    default:
+      ref.store(
+          value, sycl::memory_order::release, sycl::memory_scope::system);
+  }
+}
+
+inline uint32_t observe_signal(const uint32_t* ptr, int32_t mode) {
+  signal_ref_t ref(*const_cast<uint32_t*>(ptr));
+  if (mode == 1) {
+    return ref.fetch_or(
+        0u, sycl::memory_order::acquire, sycl::memory_scope::system);
+  }
+  return ref.load(sycl::memory_order::acquire, sycl::memory_scope::system);
+}
+
+inline int32_t env_mode(const char* name) {
+  const char* value = std::getenv(name);
+  return value == nullptr ? 0 : std::atoi(value);
+}
+
 inline bool wait_for_epoch(
-    const uint32_t* ptr, uint32_t epoch, int64_t* trace_buf, int64_t src) {
+    const uint32_t* ptr,
+    uint32_t epoch,
+    int64_t* trace_buf,
+    int64_t src,
+    int32_t wait_mode) {
   for (uint64_t spins = 0; spins < kSpinLimit; ++spins) {
-    const uint32_t cur = load_acquire_system(ptr);
+    const uint32_t cur = observe_signal(ptr, wait_mode);
     // Wrap-safe >=: a peer that already moved on must not strand the waiter.
     if (static_cast<int32_t>(cur - epoch) >= 0) {
       return true;
@@ -265,6 +313,7 @@ struct SignalPeers {
   int64_t world_size;
   int64_t rank;
   int64_t signal_stride;
+  int32_t signal_mode;
 
   void operator()(sycl::nd_item<1> item) const {
     const int64_t destination_rank = item.get_global_id(0);
@@ -274,8 +323,10 @@ struct SignalPeers {
     const uint32_t epoch = static_cast<uint32_t>(epoch_ptr[0]);
     const int64_t parity = static_cast<int64_t>(epoch & 1u);
     auto* peer_signal = get_peer_ptr<uint32_t>(peer_signal_ptrs, destination_rank);
-    store_release_system(
-        peer_signal + (parity * world_size + rank) * signal_stride, epoch);
+    publish_signal(
+        peer_signal + (parity * world_size + rank) * signal_stride,
+        epoch,
+        signal_mode);
     trace(trace_buf, 2, destination_rank, epoch, parity);
     trace(
         trace_buf,
@@ -300,8 +351,10 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
       int64_t head_dim,
       bool is_lse_base_on_e,
       int64_t signal_stride,
+      int32_t wait_mode,
       int64_t* trace_buf)
       : signal_stride_(signal_stride),
+        wait_mode_(wait_mode),
         trace_buf_(trace_buf),
         received_output_(received_output),
         received_lse_(received_lse),
@@ -360,7 +413,8 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
                 received_signal_ + (parity * world_size_ + src) * signal_stride_,
                 epoch,
                 tb,
-                src)) {
+                src,
+                wait_mode_)) {
           if (tb != nullptr) {
             trace(
                 tb,
@@ -445,6 +499,7 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
 
  private:
   int64_t signal_stride_;
+  int32_t wait_mode_;
   int64_t* trace_buf_;
   const scalar_t* received_output_;
   const float* received_lse_;
@@ -588,6 +643,8 @@ void direct_dcp_a2a_lse_reduce(
   int64_t* epoch_ptr = epoch.data_ptr<int64_t>();
 
   int64_t* trace_buf = trace_buffer(queue);
+  static const int32_t signal_mode = env_mode("DCP_A2A_SIGNAL_MODE");
+  static const int32_t wait_mode = env_mode("DCP_A2A_WAIT_MODE");
   vllm::xpu::sycl_kernel_submit(queue, 1, 1, IncrementEpoch{epoch_ptr, trace_buf});
 
   auto launch_dispatch = [&](auto lse_tag) {
@@ -631,7 +688,13 @@ void direct_dcp_a2a_lse_reduce(
       signal_groups * kExchangeThreads,
       kExchangeThreads,
       SignalPeers{
-          trace_buf, signal_ptrs, epoch_ptr, world_size, rank, signal_stride});
+          trace_buf,
+          signal_ptrs,
+          epoch_ptr,
+          world_size,
+          rank,
+          signal_stride,
+          signal_mode});
 
   auto launch_combine = [&](auto scalar_tag) {
     using scalar_t = decltype(scalar_tag);
@@ -652,6 +715,7 @@ void direct_dcp_a2a_lse_reduce(
             head_dim,
             is_lse_base_on_e,
             signal_stride,
+            wait_mode,
             trace_buf));
   };
   if (output_dtype == at::kBFloat16) {
