@@ -7,6 +7,7 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -124,8 +125,11 @@ class DispatchOutputLse : public xpu::SyclKernelConfigConvention {
     const int64_t tid = item.get_local_id(0);
     const int64_t block_size = item.get_local_range(0);
     const int64_t work_item = item.get_group(0);
-    const int64_t destination_rank = work_item / num_tokens_;
-    const int64_t token_idx = work_item - destination_rank * num_tokens_;
+    // Work-groups roughly start in id order; rotate destinations per rank so
+    // peers do not all write the same device at once (PCIe incast).
+    const int64_t step = work_item / num_tokens_;
+    const int64_t token_idx = work_item - step * num_tokens_;
+    const int64_t destination_rank = (rank_ + 1 + step) % world_size_;
 
     if (tid == 0) {
       int32_t empty = 0;
@@ -217,7 +221,8 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
       int64_t heads_per_rank,
       int64_t head_dim,
       bool is_lse_base_on_e,
-      int64_t signal_stride)
+      int64_t signal_stride,
+      int64_t heads_per_group)
       : received_output_(received_output),
         received_lse_(received_lse),
         received_signal_(received_signal),
@@ -228,20 +233,27 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
         heads_per_rank_(heads_per_rank),
         head_dim_(head_dim),
         is_lse_base_on_e_(is_lse_base_on_e),
-        signal_stride_(signal_stride) {}
+        signal_stride_(signal_stride),
+        heads_per_group_(heads_per_group) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
     weights_ =
-        sycl::local_accessor<float, 1>(world_size_ * heads_per_rank_, cgh);
+        sycl::local_accessor<float, 1>(world_size_ * heads_per_group_, cgh);
     timed_out_ = sycl::local_accessor<int32_t, 1>(1, cgh);
   }
 
-  // One work-group per token covers all of its heads: per-(token, head)
-  // groups made thousands of waiters hammer the same signal words.
+  // Each work-group covers heads_per_group heads of one token, sized so the
+  // grid stays small: thousands of waiters on the same signal words serialize.
   void operator()(sycl::nd_item<1> item) const {
     const int64_t tid = item.get_local_id(0);
     const int64_t block_size = item.get_local_range(0);
-    const int64_t token_idx = item.get_group(0);
+    const int64_t groups_per_token =
+        (heads_per_rank_ + heads_per_group_ - 1) / heads_per_group_;
+    const int64_t token_idx = item.get_group(0) / groups_per_token;
+    const int64_t head_begin =
+        (item.get_group(0) - token_idx * groups_per_token) * heads_per_group_;
+    const int64_t head_count =
+        sycl::min(heads_per_group_, heads_per_rank_ - head_begin);
     const uint32_t epoch = static_cast<uint32_t>(epoch_ptr_[0]);
     const int64_t parity = static_cast<int64_t>(epoch & 1u);
     constexpr float inf = std::numeric_limits<float>::infinity();
@@ -269,8 +281,10 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
         sycl::memory_order::acquire, sycl::memory_scope::system);
     const bool timed_out = timed_out_[0] != 0;
 
-    for (int64_t head = tid; head < heads_per_rank_; head += block_size) {
-      float* weights = &weights_[head * world_size_];
+    for (int64_t local_head = tid; local_head < head_count;
+         local_head += block_size) {
+      const int64_t head = head_begin + local_head;
+      float* weights = &weights_[local_head * world_size_];
       if (timed_out) {
         // Surface the failure as NaNs instead of hanging the device.
         for (int64_t src = 0; src < world_size_; ++src) {
@@ -311,12 +325,16 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
     constexpr int64_t kVec = sizeof(sycl::uint4) / sizeof(scalar_t);
     const int64_t vectors_per_head = head_dim_ / kVec;
     const int64_t vectors_per_token = heads_per_rank_ * vectors_per_head;
+    const int64_t vector_begin = head_begin * vectors_per_head;
     const auto* received =
         reinterpret_cast<const sycl::uint4*>(received_output_);
     auto* combined = reinterpret_cast<sycl::uint4*>(combined_output_);
-    for (int64_t v = tid; v < vectors_per_token; v += block_size) {
-      const int64_t head = v / vectors_per_head;
-      const float* weights = &weights_[head * world_size_];
+    for (int64_t local_vector = tid;
+         local_vector < head_count * vectors_per_head;
+         local_vector += block_size) {
+      const int64_t v = vector_begin + local_vector;
+      const float* weights =
+          &weights_[(local_vector / vectors_per_head) * world_size_];
       float accumulator[kVec] = {};
       for (int64_t src = 0; src < world_size_; ++src) {
         const float weight = weights[src];
@@ -354,6 +372,7 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
   int64_t world_size_, max_num_tokens_, heads_per_rank_, head_dim_;
   bool is_lse_base_on_e_;
   int64_t signal_stride_;
+  int64_t heads_per_group_;
   sycl::local_accessor<float, 1> weights_;
   sycl::local_accessor<int32_t, 1> timed_out_;
 };
@@ -517,6 +536,7 @@ void direct_dcp_a2a_lse_reduce(
   auto& queue = vllm::xpu::vllmGetQueue();
   constexpr int64_t kExchangeThreads = 256;
   constexpr int64_t kCombineThreads = 256;
+  constexpr int64_t kCombineTargetGroups = 128;
   int64_t* epoch_ptr = epoch.data_ptr<int64_t>();
 
   vllm::xpu::sycl_kernel_submit(queue, 1, 1, IncrementEpoch{epoch_ptr});
@@ -562,11 +582,22 @@ void direct_dcp_a2a_lse_reduce(
       kExchangeThreads,
       SignalPeers{signal_ptrs, epoch_ptr, world_size, rank, signal_stride});
 
+  // Split each token's heads across groups only while the grid stays near
+  // kCombineTargetGroups, keeping small batches parallel without flooding
+  // the signal words with waiters.
+  const int64_t heads_per_group = std::min(
+      heads_per_rank,
+      std::max<int64_t>(
+          1,
+          (num_tokens * heads_per_rank + kCombineTargetGroups - 1) /
+              kCombineTargetGroups));
+  const int64_t combine_groups =
+      num_tokens * ((heads_per_rank + heads_per_group - 1) / heads_per_group);
   auto launch_combine = [&](auto scalar_tag) {
     using scalar_t = decltype(scalar_tag);
     vllm::xpu::sycl_kernel_submit(
         queue,
-        num_tokens * kCombineThreads,
+        combine_groups * kCombineThreads,
         kCombineThreads,
         WaitLseCombine<scalar_t>(
             reinterpret_cast<const scalar_t*>(received_output.data_ptr()),
@@ -580,7 +611,8 @@ void direct_dcp_a2a_lse_reduce(
             heads_per_rank,
             head_dim,
             is_lse_base_on_e,
-            signal_stride));
+            signal_stride,
+            heads_per_group));
   };
   if (output_dtype == at::kBFloat16) {
     launch_combine(sycl::ext::oneapi::bfloat16{});
