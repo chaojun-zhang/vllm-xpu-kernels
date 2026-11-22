@@ -32,6 +32,7 @@ constexpr int64_t kTraceFields = 8;
 // Event kinds: 1 IncrementEpoch(old,new) 2 SignalPeers(dst,epoch,parity)
 // 3 WaitBegin(src,want,sig0,sig1) 4 WaitOk(src,want)
 // 5 WaitSpin(src,want,cur) 6 WaitTimeout(src,want,sig0,sig1)
+// 7 EpochChanged(started_with,now): epoch moved while combine was running
 
 using trace_ref_t = sycl::atomic_ref<
     int64_t,
@@ -106,7 +107,8 @@ inline bool wait_for_epoch(
     const uint32_t* ptr, uint32_t epoch, int64_t* trace_buf, int64_t src) {
   for (uint64_t spins = 0; spins < kSpinLimit; ++spins) {
     const uint32_t cur = load_acquire_system(ptr);
-    if (cur == epoch) {
+    // Wrap-safe >=: a peer that already moved on must not strand the waiter.
+    if (static_cast<int32_t>(cur - epoch) >= 0) {
       return true;
     }
     if (trace_buf != nullptr && spins != 0 && (spins & 0x3fffff) == 0) {
@@ -383,6 +385,17 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
       }
     }
     sycl::group_barrier(item.get_group());
+    // Only tid 0 acquired the signal; make peer data visible to every thread.
+    sycl::atomic_fence(
+        sycl::memory_order::acquire, sycl::memory_scope::system);
+#ifdef DCP_A2A_DEBUG
+    if (tid == 0 && token_idx == 0 && head_idx == 0 && trace_buf_ != nullptr) {
+      const uint32_t now = static_cast<uint32_t>(epoch_ptr_[0]);
+      if (now != epoch) {
+        trace(trace_buf_, 7, epoch, now);
+      }
+    }
+#endif
 
     for (int64_t d = tid; d < head_dim_; d += block_size) {
       float accumulator = 0.0f;
