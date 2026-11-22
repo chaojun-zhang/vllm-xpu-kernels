@@ -20,6 +20,9 @@ namespace vllm {
 namespace direct_dcp {
 
 constexpr uint64_t kSpinLimit = 100000000;
+// Peers write neighbouring signal slots and LSE/output partitions across
+// devices; sharing a cache line between writers loses stores on XPU.
+constexpr int64_t kCacheLineBytes = 64;
 constexpr float kLog2E = 1.4426950408889634f;
 
 using signal_ref_t = sycl::atomic_ref<
@@ -46,7 +49,8 @@ inline uint32_t load_acquire_system(const uint32_t* ptr) {
 
 inline bool wait_for_epoch(const uint32_t* ptr, uint32_t epoch) {
   for (uint64_t spins = 0; spins < kSpinLimit; ++spins) {
-    if (load_acquire_system(ptr) == epoch) {
+    // Wrap-safe >=: a peer that already moved on must not strand the waiter.
+    if (static_cast<int32_t>(load_acquire_system(ptr) - epoch) >= 0) {
       return true;
     }
   }
@@ -184,6 +188,7 @@ struct SignalPeers {
   const int64_t* epoch_ptr;
   int64_t world_size;
   int64_t rank;
+  int64_t signal_stride;
 
   void operator()(sycl::nd_item<1> item) const {
     const int64_t destination_rank = item.get_global_id(0);
@@ -193,7 +198,8 @@ struct SignalPeers {
     const uint32_t epoch = static_cast<uint32_t>(epoch_ptr[0]);
     const int64_t parity = static_cast<int64_t>(epoch & 1u);
     auto* peer_signal = get_peer_ptr<uint32_t>(peer_signal_ptrs, destination_rank);
-    store_release_system(peer_signal + parity * world_size + rank, epoch);
+    store_release_system(
+        peer_signal + (parity * world_size + rank) * signal_stride, epoch);
   }
 };
 
@@ -210,7 +216,8 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
       int64_t max_num_tokens,
       int64_t heads_per_rank,
       int64_t head_dim,
-      bool is_lse_base_on_e)
+      bool is_lse_base_on_e,
+      int64_t signal_stride)
       : received_output_(received_output),
         received_lse_(received_lse),
         received_signal_(received_signal),
@@ -220,7 +227,8 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
         max_num_tokens_(max_num_tokens),
         heads_per_rank_(heads_per_rank),
         head_dim_(head_dim),
-        is_lse_base_on_e_(is_lse_base_on_e) {}
+        is_lse_base_on_e_(is_lse_base_on_e),
+        signal_stride_(signal_stride) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
     weights_ = sycl::local_accessor<float, 1>(world_size_, cgh);
@@ -244,7 +252,9 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
             ((parity * world_size_ + src) * max_num_tokens_ + token_idx) *
                 heads_per_rank_ +
             head_idx;
-        if (!wait_for_epoch(received_signal_ + parity * world_size_ + src, epoch)) {
+        const uint32_t* signal =
+            received_signal_ + (parity * world_size_ + src) * signal_stride_;
+        if (!wait_for_epoch(signal, epoch)) {
           sycl::ext::oneapi::experimental::printf(
               "direct DCP A2A timeout source=%ld token=%ld head=%ld epoch=%u\n",
               static_cast<long>(src),
@@ -284,6 +294,9 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
       }
     }
     sycl::group_barrier(item.get_group());
+    // Only tid 0 acquired the signal; make peer data visible to every thread.
+    sycl::atomic_fence(
+        sycl::memory_order::acquire, sycl::memory_scope::system);
 
     for (int64_t d = tid; d < head_dim_; d += block_size) {
       float accumulator = 0.0f;
@@ -313,6 +326,7 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
   scalar_t* combined_output_;
   int64_t world_size_, max_num_tokens_, heads_per_rank_, head_dim_;
   bool is_lse_base_on_e_;
+  int64_t signal_stride_;
   sycl::local_accessor<float, 1> weights_;
 };
 
@@ -402,6 +416,44 @@ void direct_dcp_a2a_lse_reduce(
           received_lse.scalar_type() == at::kFloat &&
           received_signal.scalar_type() == at::kInt,
       "invalid symmetric staging dtypes");
+  // Signal slots are strided so each one owns a cache line; the stride is
+  // inferred from the buffer size to keep the op schema unchanged.
+  const int64_t signal_slots = 2 * world_size;
+  TORCH_CHECK(
+      received_signal.numel() % signal_slots == 0,
+      "received_signal must hold a multiple of 2 * world_size elements");
+  const int64_t signal_stride = received_signal.numel() / signal_slots;
+  TORCH_CHECK(
+      signal_stride * static_cast<int64_t>(sizeof(uint32_t)) >=
+          kCacheLineBytes,
+      "received_signal slots must be padded to ",
+      kCacheLineBytes,
+      " bytes, got stride ",
+      signal_stride);
+  // Each source rank's LSE partition (and hence output partition) must start
+  // on a cache line so different peers never write the same line.
+  TORCH_CHECK(
+      (max_num_tokens * heads_per_rank *
+       static_cast<int64_t>(sizeof(float))) %
+              kCacheLineBytes ==
+          0,
+      "max_num_tokens * heads_per_rank * 4 must be a multiple of ",
+      kCacheLineBytes,
+      " bytes");
+  TORCH_CHECK(
+      reinterpret_cast<uintptr_t>(partial_output.data_ptr()) % 16 == 0 &&
+          reinterpret_cast<uintptr_t>(received_output.data_ptr()) %
+                  kCacheLineBytes ==
+              0 &&
+          reinterpret_cast<uintptr_t>(received_lse.data_ptr()) %
+                  kCacheLineBytes ==
+              0 &&
+          reinterpret_cast<uintptr_t>(received_signal.data_ptr()) %
+                  kCacheLineBytes ==
+              0,
+      "partial_output must be 16-byte aligned and staging buffers ",
+      kCacheLineBytes,
+      "-byte aligned");
   TORCH_CHECK(
       epoch.scalar_type() == at::kLong && epoch.numel() >= 1,
       "epoch must be an int64 tensor");
@@ -480,7 +532,7 @@ void direct_dcp_a2a_lse_reduce(
       queue,
       signal_groups * kExchangeThreads,
       kExchangeThreads,
-      SignalPeers{signal_ptrs, epoch_ptr, world_size, rank});
+      SignalPeers{signal_ptrs, epoch_ptr, world_size, rank, signal_stride});
 
   auto launch_combine = [&](auto scalar_tag) {
     using scalar_t = decltype(scalar_tag);
@@ -499,7 +551,8 @@ void direct_dcp_a2a_lse_reduce(
             max_num_tokens,
             heads_per_rank,
             head_dim,
-            is_lse_base_on_e));
+            is_lse_base_on_e,
+            signal_stride));
   };
   if (output_dtype == at::kBFloat16) {
     launch_combine(sycl::ext::oneapi::bfloat16{});
