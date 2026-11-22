@@ -20,7 +20,8 @@
 namespace vllm {
 // TEMPORARY DEBUG: remove before merging. Records kernel events into a
 // host-pinned ring so a hung run can be inspected from the host.
-#define DCP_A2A_DEBUG 1
+// Enable with -DDCP_A2A_DEBUG (trace ring perturbs timing).
+// #define DCP_A2A_DEBUG 1
 
 namespace direct_dcp {
 
