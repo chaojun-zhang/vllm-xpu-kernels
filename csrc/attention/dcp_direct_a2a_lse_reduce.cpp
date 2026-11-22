@@ -32,6 +32,8 @@ constexpr int64_t kTraceFields = 8;
 // Event kinds: 1 IncrementEpoch(old,new) 2 SignalPeers(dst,epoch,parity)
 // 3 WaitBegin(src,want,sig0,sig1) 4 WaitOk(src,want)
 // 5 WaitSpin(src,want,cur) 6 WaitTimeout(src,want,sig0,sig1)
+// 8 SignalAddr(dst,peer_signal_ptr) 9 CombineStart(epoch,received_signal_ptr)
+// 10 DispatchStart(epoch)
 // 7 EpochChanged(started_with,now): epoch moved while combine was running
 
 using trace_ref_t = sycl::atomic_ref<
@@ -163,8 +165,10 @@ class DispatchOutputLse : public xpu::SyclKernelConfigConvention {
       int64_t head_dim,
       int64_t output_token_stride,
       int64_t lse_token_stride,
-      int64_t lse_head_stride)
-      : partial_output_(partial_output),
+      int64_t lse_head_stride,
+      int64_t* trace_buf)
+      : trace_buf_(trace_buf),
+        partial_output_(partial_output),
         partial_lse_(partial_lse),
         seq_lens_(seq_lens),
         query_start_loc_(query_start_loc),
@@ -207,6 +211,9 @@ class DispatchOutputLse : public xpu::SyclKernelConfigConvention {
 
     const uint32_t epoch = static_cast<uint32_t>(epoch_ptr_[0]);
     const int64_t parity = static_cast<int64_t>(epoch & 1u);
+    if (work_item == 0 && tid == 0) {
+      trace(trace_buf_, 10, epoch);
+    }
     const int64_t destination_item =
         ((parity * world_size_ + rank_) * max_num_tokens_ + token_idx) *
         heads_per_rank_;
@@ -236,6 +243,7 @@ class DispatchOutputLse : public xpu::SyclKernelConfigConvention {
   }
 
  private:
+  int64_t* trace_buf_;
   const sycl::uint4* partial_output_;
   const lse_t* partial_lse_;
   const int32_t* seq_lens_;
@@ -268,6 +276,11 @@ struct SignalPeers {
     store_release_system(
         peer_signal + (parity * world_size + rank) * signal_stride, epoch);
     trace(trace_buf, 2, destination_rank, epoch, parity);
+    trace(
+        trace_buf,
+        8,
+        destination_rank,
+        reinterpret_cast<int64_t>(peer_signal));
   }
 };
 
@@ -314,6 +327,13 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
     const int64_t parity = static_cast<int64_t>(epoch & 1u);
     constexpr float inf = std::numeric_limits<float>::infinity();
 
+    if (tid == 0 && token_idx == 0 && head_idx == 0) {
+      trace(
+          trace_buf_,
+          9,
+          epoch,
+          reinterpret_cast<int64_t>(received_signal_));
+    }
     if (tid == 0) {
       float lse_max = -inf;
       bool timed_out = false;
@@ -587,7 +607,8 @@ void direct_dcp_a2a_lse_reduce(
             head_dim,
             output_token_stride,
             lse_token_stride,
-            lse_head_stride));
+            lse_head_stride,
+            trace_buf));
   };
   if (lse_dtype == at::kFloat) {
     launch_dispatch(float{});
