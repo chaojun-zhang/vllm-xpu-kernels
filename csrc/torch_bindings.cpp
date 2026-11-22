@@ -203,10 +203,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl(
       "direct_dcp_a2a_lse_reduce", torch::kXPU, &direct_dcp_a2a_lse_reduce);
 
-  // TEMPORARY DEBUG: expose the kernel trace ring.
-  ops.def("direct_dcp_a2a_trace(bool reset) -> Tensor");
-  ops.impl("direct_dcp_a2a_trace", torch::kCPU, &direct_dcp_a2a_trace);
-
   // Compute FP8 quantized tensor for given scaling factor.
   ops.def(
       "static_scaled_fp8_quant(Tensor! result, Tensor input, Tensor scale, "

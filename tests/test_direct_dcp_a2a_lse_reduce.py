@@ -18,6 +18,7 @@ import vllm_xpu_kernels._C  # noqa: F401
 HEADS_PER_RANK = 6
 HEAD_DIM = 64
 # One 128B cache line per signal slot; the kernel infers it from the size.
+# Unpadded slots shared a line across devices and lost back-to-back signals.
 SIGNAL_STRIDE = 32
 MAX_NUM_TOKENS = 32
 WORKER_TIMEOUT_S = 90
@@ -313,19 +314,7 @@ def test_direct_dcp_a2a_lse_reduce_empty_sequences(world_size):
 
 
 @pytest.mark.parametrize("world_size", WORLD_SIZES)
-@pytest.mark.parametrize(
-    "sync_between_replays",
-    [
-        True,
-        pytest.param(
-            False,
-            marks=pytest.mark.xfail(
-                reason="Back-to-back graph replays deadlock; under "
-                "investigation.",
-                strict=False),
-        ),
-    ],
-)
+@pytest.mark.parametrize("sync_between_replays", [True, False])
 def test_direct_dcp_a2a_lse_reduce_graph_replay(world_size,
                                                 sync_between_replays):
     _run_distributed(
@@ -333,3 +322,33 @@ def test_direct_dcp_a2a_lse_reduce_graph_replay(world_size,
         dict(kind="graph", lse_dtype="float32", base_e=False,
              sync_between_replays=sync_between_replays),
     )
+
+
+@pytest.mark.parametrize(
+    "signal_stride,max_num_tokens",
+    [(1, MAX_NUM_TOKENS), (SIGNAL_STRIDE, 1)],
+    ids=["unpadded_signal", "unaligned_partition"],
+)
+def test_direct_dcp_a2a_lse_reduce_rejects_line_sharing_layout(
+        signal_stride, max_num_tokens):
+    """Layouts where peers would write a shared cache line must be refused."""
+    world_size, device = 2, torch.device("xpu", 0)
+    total_heads = world_size * HEADS_PER_RANK
+    partial_output = torch.zeros(1, total_heads, HEAD_DIM,
+                                 dtype=torch.bfloat16, device=device)
+    partial_lse = torch.zeros(1, total_heads, device=device)
+    ptrs = torch.zeros(world_size, dtype=torch.uint64, device=device)
+    received_output = torch.zeros(2, world_size, max_num_tokens,
+                                  HEADS_PER_RANK, HEAD_DIM,
+                                  dtype=torch.bfloat16, device=device)
+    received_lse = torch.zeros(2, world_size, max_num_tokens,
+                               HEADS_PER_RANK, device=device)
+    received_signal = torch.zeros(2, world_size, signal_stride,
+                                  dtype=torch.int32, device=device)
+    with pytest.raises(RuntimeError, match="bytes"):
+        torch.ops._C.direct_dcp_a2a_lse_reduce(
+            partial_output, partial_lse, None, None, ptrs, ptrs, ptrs,
+            received_output, received_lse, received_signal,
+            torch.zeros(1, dtype=torch.int64, device=device),
+            partial_output.new_empty(1, HEADS_PER_RANK, HEAD_DIM),
+            world_size, 0, max_num_tokens, False)

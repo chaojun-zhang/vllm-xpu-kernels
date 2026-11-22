@@ -9,8 +9,6 @@
 
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
 #include <limits>
 #include <optional>
 #include <sycl/sycl.hpp>
@@ -19,71 +17,13 @@
 #include "utils.h"
 
 namespace vllm {
-// TEMPORARY DEBUG: remove before merging. Records kernel events into a
-// host-pinned ring so a hung run can be inspected from the host.
-// Enable with -DDCP_A2A_DEBUG (trace ring perturbs timing).
-// #define DCP_A2A_DEBUG 1
-
 namespace direct_dcp {
 
 constexpr uint64_t kSpinLimit = 100000000;
+// Peers write neighbouring signal slots and LSE/output partitions across
+// devices; sharing a cache line between writers loses stores on XPU.
+constexpr int64_t kCacheLineBytes = 64;
 constexpr float kLog2E = 1.4426950408889634f;
-
-constexpr int64_t kTraceRecords = 1 << 16;
-constexpr int64_t kTraceFields = 8;
-// Event kinds: 1 IncrementEpoch(old,new) 2 SignalPeers(dst,epoch,parity)
-// 3 WaitBegin(src,want,sig0,sig1) 4 WaitOk(src,want)
-// 5 WaitSpin(src,want,cur) 6 WaitTimeout(src,want,sig0,sig1)
-// 8 SignalAddr(dst,peer_signal_ptr) 9 CombineStart(epoch,received_signal_ptr)
-// 10 DispatchStart(epoch)
-// 7 EpochChanged(started_with,now): epoch moved while combine was running
-
-using trace_ref_t = sycl::atomic_ref<
-    int64_t,
-    sycl::memory_order::relaxed,
-    sycl::memory_scope::system,
-    sycl::access::address_space::global_space>;
-
-inline void trace(
-    int64_t* buf,
-    int64_t kind,
-    int64_t a = 0,
-    int64_t b = 0,
-    int64_t c = 0,
-    int64_t d = 0) {
-#ifdef DCP_A2A_DEBUG
-  if (buf == nullptr) {
-    return;
-  }
-  trace_ref_t counter(buf[0]);
-  const int64_t idx = counter.fetch_add(1);
-  if (idx >= kTraceRecords) {
-    return;
-  }
-  int64_t* rec = buf + kTraceFields + idx * kTraceFields;
-  rec[2] = a;
-  rec[3] = b;
-  rec[4] = c;
-  rec[5] = d;
-  rec[7] = idx;
-  trace_ref_t(rec[0]).store(
-      kind, sycl::memory_order::release, sycl::memory_scope::system);
-#endif
-}
-
-int64_t* trace_buffer(sycl::queue& queue) {
-#ifdef DCP_A2A_DEBUG
-  static int64_t* buf = [&] {
-    const size_t n = kTraceFields * (kTraceRecords + 1);
-    auto* ptr = sycl::malloc_host<int64_t>(n, queue);
-    std::memset(ptr, 0, n * sizeof(int64_t));
-    return ptr;
-  }();
-  return buf;
-#else
-  return nullptr;
-#endif
-}
 
 using signal_ref_t = sycl::atomic_ref<
     uint32_t,
@@ -107,63 +47,11 @@ inline uint32_t load_acquire_system(const uint32_t* ptr) {
   return ref.load(sycl::memory_order::acquire, sycl::memory_scope::system);
 }
 
-// TEMPORARY EXPERIMENT: runtime-selectable signal publish/observe variants,
-// chosen via DCP_A2A_SIGNAL_MODE / DCP_A2A_WAIT_MODE to locate the
-// lost-signal hang with a single build.
-//   signal: 0 release store, 1 release store + seq_cst system fence,
-//           2 release exchange, 3 release fetch_max
-//   wait:   0 acquire load, 1 acquire fetch_or(0)
-inline void publish_signal(uint32_t* ptr, uint32_t value, int32_t mode) {
-  signal_ref_t ref(*ptr);
-  switch (mode) {
-    case 1:
-      ref.store(
-          value, sycl::memory_order::release, sycl::memory_scope::system);
-      sycl::atomic_fence(
-          sycl::memory_order::seq_cst, sycl::memory_scope::system);
-      break;
-    case 2:
-      ref.exchange(
-          value, sycl::memory_order::release, sycl::memory_scope::system);
-      break;
-    case 3:
-      ref.fetch_max(
-          value, sycl::memory_order::release, sycl::memory_scope::system);
-      break;
-    default:
-      ref.store(
-          value, sycl::memory_order::release, sycl::memory_scope::system);
-  }
-}
-
-inline uint32_t observe_signal(const uint32_t* ptr, int32_t mode) {
-  signal_ref_t ref(*const_cast<uint32_t*>(ptr));
-  if (mode == 1) {
-    return ref.fetch_or(
-        0u, sycl::memory_order::acquire, sycl::memory_scope::system);
-  }
-  return ref.load(sycl::memory_order::acquire, sycl::memory_scope::system);
-}
-
-inline int32_t env_mode(const char* name) {
-  const char* value = std::getenv(name);
-  return value == nullptr ? 0 : std::atoi(value);
-}
-
-inline bool wait_for_epoch(
-    const uint32_t* ptr,
-    uint32_t epoch,
-    int64_t* trace_buf,
-    int64_t src,
-    int32_t wait_mode) {
+inline bool wait_for_epoch(const uint32_t* ptr, uint32_t epoch) {
   for (uint64_t spins = 0; spins < kSpinLimit; ++spins) {
-    const uint32_t cur = observe_signal(ptr, wait_mode);
     // Wrap-safe >=: a peer that already moved on must not strand the waiter.
-    if (static_cast<int32_t>(cur - epoch) >= 0) {
+    if (static_cast<int32_t>(load_acquire_system(ptr) - epoch) >= 0) {
       return true;
-    }
-    if (trace_buf != nullptr && spins != 0 && (spins & 0x3fffff) == 0) {
-      trace(trace_buf, 5, src, epoch, cur);
     }
   }
   return false;
@@ -186,12 +74,7 @@ inline int64_t find_sequence(
 
 struct IncrementEpoch {
   int64_t* epoch;
-  int64_t* trace_buf;
-  void operator()(sycl::nd_item<1>) const {
-    const int64_t old_epoch = epoch[0];
-    epoch[0] += 1;
-    trace(trace_buf, 1, old_epoch, epoch[0]);
-  }
+  void operator()(sycl::nd_item<1>) const { epoch[0] += 1; }
 };
 
 template <typename lse_t>
@@ -214,10 +97,8 @@ class DispatchOutputLse : public xpu::SyclKernelConfigConvention {
       int64_t head_dim,
       int64_t output_token_stride,
       int64_t lse_token_stride,
-      int64_t lse_head_stride,
-      int64_t* trace_buf)
-      : trace_buf_(trace_buf),
-        partial_output_(partial_output),
+      int64_t lse_head_stride)
+      : partial_output_(partial_output),
         partial_lse_(partial_lse),
         seq_lens_(seq_lens),
         query_start_loc_(query_start_loc),
@@ -260,9 +141,6 @@ class DispatchOutputLse : public xpu::SyclKernelConfigConvention {
 
     const uint32_t epoch = static_cast<uint32_t>(epoch_ptr_[0]);
     const int64_t parity = static_cast<int64_t>(epoch & 1u);
-    if (work_item == 0 && tid == 0) {
-      trace(trace_buf_, 10, epoch);
-    }
     const int64_t destination_item =
         ((parity * world_size_ + rank_) * max_num_tokens_ + token_idx) *
         heads_per_rank_;
@@ -292,7 +170,6 @@ class DispatchOutputLse : public xpu::SyclKernelConfigConvention {
   }
 
  private:
-  int64_t* trace_buf_;
   const sycl::uint4* partial_output_;
   const lse_t* partial_lse_;
   const int32_t* seq_lens_;
@@ -307,13 +184,11 @@ class DispatchOutputLse : public xpu::SyclKernelConfigConvention {
 };
 
 struct SignalPeers {
-  int64_t* trace_buf;
   const uint64_t* peer_signal_ptrs;
   const int64_t* epoch_ptr;
   int64_t world_size;
   int64_t rank;
   int64_t signal_stride;
-  int32_t signal_mode;
 
   void operator()(sycl::nd_item<1> item) const {
     const int64_t destination_rank = item.get_global_id(0);
@@ -323,16 +198,8 @@ struct SignalPeers {
     const uint32_t epoch = static_cast<uint32_t>(epoch_ptr[0]);
     const int64_t parity = static_cast<int64_t>(epoch & 1u);
     auto* peer_signal = get_peer_ptr<uint32_t>(peer_signal_ptrs, destination_rank);
-    publish_signal(
-        peer_signal + (parity * world_size + rank) * signal_stride,
-        epoch,
-        signal_mode);
-    trace(trace_buf, 2, destination_rank, epoch, parity);
-    trace(
-        trace_buf,
-        8,
-        destination_rank,
-        reinterpret_cast<int64_t>(peer_signal));
+    store_release_system(
+        peer_signal + (parity * world_size + rank) * signal_stride, epoch);
   }
 };
 
@@ -350,13 +217,8 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
       int64_t heads_per_rank,
       int64_t head_dim,
       bool is_lse_base_on_e,
-      int64_t signal_stride,
-      int32_t wait_mode,
-      int64_t* trace_buf)
-      : signal_stride_(signal_stride),
-        wait_mode_(wait_mode),
-        trace_buf_(trace_buf),
-        received_output_(received_output),
+      int64_t signal_stride)
+      : received_output_(received_output),
         received_lse_(received_lse),
         received_signal_(received_signal),
         epoch_ptr_(epoch_ptr),
@@ -365,7 +227,8 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
         max_num_tokens_(max_num_tokens),
         heads_per_rank_(heads_per_rank),
         head_dim_(head_dim),
-        is_lse_base_on_e_(is_lse_base_on_e) {}
+        is_lse_base_on_e_(is_lse_base_on_e),
+        signal_stride_(signal_stride) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
     weights_ = sycl::local_accessor<float, 1>(world_size_, cgh);
@@ -381,13 +244,6 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
     const int64_t parity = static_cast<int64_t>(epoch & 1u);
     constexpr float inf = std::numeric_limits<float>::infinity();
 
-    if (tid == 0 && token_idx == 0 && head_idx == 0) {
-      trace(
-          trace_buf_,
-          9,
-          epoch,
-          reinterpret_cast<int64_t>(received_signal_));
-    }
     if (tid == 0) {
       float lse_max = -inf;
       bool timed_out = false;
@@ -396,35 +252,9 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
             ((parity * world_size_ + src) * max_num_tokens_ + token_idx) *
                 heads_per_rank_ +
             head_idx;
-        const bool traced = token_idx == 0 && head_idx == 0;
-        int64_t* tb = traced ? trace_buf_ : nullptr;
-        // Guarded so the extra system loads only run when tracing.
-        if (tb != nullptr) {
-          trace(
-              tb,
-              3,
-              src,
-              epoch,
-              load_acquire_system(received_signal_ + src * signal_stride_),
-              load_acquire_system(
-                  received_signal_ + (world_size_ + src) * signal_stride_));
-        }
-        if (!wait_for_epoch(
-                received_signal_ + (parity * world_size_ + src) * signal_stride_,
-                epoch,
-                tb,
-                src,
-                wait_mode_)) {
-          if (tb != nullptr) {
-            trace(
-                tb,
-                6,
-                src,
-                epoch,
-                load_acquire_system(received_signal_ + src * signal_stride_),
-                load_acquire_system(
-                    received_signal_ + (world_size_ + src) * signal_stride_));
-          }
+        const uint32_t* signal =
+            received_signal_ + (parity * world_size_ + src) * signal_stride_;
+        if (!wait_for_epoch(signal, epoch)) {
           sycl::ext::oneapi::experimental::printf(
               "direct DCP A2A timeout source=%ld token=%ld head=%ld epoch=%u\n",
               static_cast<long>(src),
@@ -434,7 +264,6 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
           timed_out = true;
           break;
         }
-        trace(tb, 4, src, epoch);
         float value = received_lse_[source_item];
         if (sycl::isnan(value) || value == inf) {
           value = -inf;
@@ -468,14 +297,6 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
     // Only tid 0 acquired the signal; make peer data visible to every thread.
     sycl::atomic_fence(
         sycl::memory_order::acquire, sycl::memory_scope::system);
-#ifdef DCP_A2A_DEBUG
-    if (tid == 0 && token_idx == 0 && head_idx == 0 && trace_buf_ != nullptr) {
-      const uint32_t now = static_cast<uint32_t>(epoch_ptr_[0]);
-      if (now != epoch) {
-        trace(trace_buf_, 7, epoch, now);
-      }
-    }
-#endif
 
     for (int64_t d = tid; d < head_dim_; d += block_size) {
       float accumulator = 0.0f;
@@ -498,9 +319,6 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
   }
 
  private:
-  int64_t signal_stride_;
-  int32_t wait_mode_;
-  int64_t* trace_buf_;
   const scalar_t* received_output_;
   const float* received_lse_;
   const uint32_t* received_signal_;
@@ -508,6 +326,7 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
   scalar_t* combined_output_;
   int64_t world_size_, max_num_tokens_, heads_per_rank_, head_dim_;
   bool is_lse_base_on_e_;
+  int64_t signal_stride_;
   sycl::local_accessor<float, 1> weights_;
 };
 
@@ -597,14 +416,44 @@ void direct_dcp_a2a_lse_reduce(
           received_lse.scalar_type() == at::kFloat &&
           received_signal.scalar_type() == at::kInt,
       "invalid symmetric staging dtypes");
-  // Signal slots may be padded (one cache line each) so that writers on
-  // different devices never share a line; the stride is inferred from size.
+  // Signal slots are strided so each one owns a cache line; the stride is
+  // inferred from the buffer size to keep the op schema unchanged.
   const int64_t signal_slots = 2 * world_size;
   TORCH_CHECK(
-      received_signal.numel() >= signal_slots &&
-          received_signal.numel() % signal_slots == 0,
+      received_signal.numel() % signal_slots == 0,
       "received_signal must hold a multiple of 2 * world_size elements");
   const int64_t signal_stride = received_signal.numel() / signal_slots;
+  TORCH_CHECK(
+      signal_stride * static_cast<int64_t>(sizeof(uint32_t)) >=
+          kCacheLineBytes,
+      "received_signal slots must be padded to ",
+      kCacheLineBytes,
+      " bytes, got stride ",
+      signal_stride);
+  // Each source rank's LSE partition (and hence output partition) must start
+  // on a cache line so different peers never write the same line.
+  TORCH_CHECK(
+      (max_num_tokens * heads_per_rank *
+       static_cast<int64_t>(sizeof(float))) %
+              kCacheLineBytes ==
+          0,
+      "max_num_tokens * heads_per_rank * 4 must be a multiple of ",
+      kCacheLineBytes,
+      " bytes");
+  TORCH_CHECK(
+      reinterpret_cast<uintptr_t>(partial_output.data_ptr()) % 16 == 0 &&
+          reinterpret_cast<uintptr_t>(received_output.data_ptr()) %
+                  kCacheLineBytes ==
+              0 &&
+          reinterpret_cast<uintptr_t>(received_lse.data_ptr()) %
+                  kCacheLineBytes ==
+              0 &&
+          reinterpret_cast<uintptr_t>(received_signal.data_ptr()) %
+                  kCacheLineBytes ==
+              0,
+      "partial_output must be 16-byte aligned and staging buffers ",
+      kCacheLineBytes,
+      "-byte aligned");
   TORCH_CHECK(
       epoch.scalar_type() == at::kLong && epoch.numel() >= 1,
       "epoch must be an int64 tensor");
@@ -642,10 +491,7 @@ void direct_dcp_a2a_lse_reduce(
   constexpr int64_t kCombineThreads = 128;
   int64_t* epoch_ptr = epoch.data_ptr<int64_t>();
 
-  int64_t* trace_buf = trace_buffer(queue);
-  static const int32_t signal_mode = env_mode("DCP_A2A_SIGNAL_MODE");
-  static const int32_t wait_mode = env_mode("DCP_A2A_WAIT_MODE");
-  vllm::xpu::sycl_kernel_submit(queue, 1, 1, IncrementEpoch{epoch_ptr, trace_buf});
+  vllm::xpu::sycl_kernel_submit(queue, 1, 1, IncrementEpoch{epoch_ptr});
 
   auto launch_dispatch = [&](auto lse_tag) {
     using lse_t = decltype(lse_tag);
@@ -670,8 +516,7 @@ void direct_dcp_a2a_lse_reduce(
             head_dim,
             output_token_stride,
             lse_token_stride,
-            lse_head_stride,
-            trace_buf));
+            lse_head_stride));
   };
   if (lse_dtype == at::kFloat) {
     launch_dispatch(float{});
@@ -687,14 +532,7 @@ void direct_dcp_a2a_lse_reduce(
       queue,
       signal_groups * kExchangeThreads,
       kExchangeThreads,
-      SignalPeers{
-          trace_buf,
-          signal_ptrs,
-          epoch_ptr,
-          world_size,
-          rank,
-          signal_stride,
-          signal_mode});
+      SignalPeers{signal_ptrs, epoch_ptr, world_size, rank, signal_stride});
 
   auto launch_combine = [&](auto scalar_tag) {
     using scalar_t = decltype(scalar_tag);
@@ -714,27 +552,11 @@ void direct_dcp_a2a_lse_reduce(
             heads_per_rank,
             head_dim,
             is_lse_base_on_e,
-            signal_stride,
-            wait_mode,
-            trace_buf));
+            signal_stride));
   };
   if (output_dtype == at::kBFloat16) {
     launch_combine(sycl::ext::oneapi::bfloat16{});
   } else {
     launch_combine(sycl::half{});
   }
-}
-
-// TEMPORARY DEBUG: alias of the host-pinned trace ring (int64 CPU tensor).
-// Element 0 is the record counter; records are 8 int64 starting at index 8.
-at::Tensor direct_dcp_a2a_trace(bool reset) {
-  auto& queue = vllm::xpu::vllmGetQueue();
-  int64_t* buf = vllm::direct_dcp::trace_buffer(queue);
-  TORCH_CHECK(buf != nullptr, "DCP_A2A_DEBUG is not enabled");
-  const int64_t n = vllm::direct_dcp::kTraceFields *
-                    (vllm::direct_dcp::kTraceRecords + 1);
-  if (reset) {
-    std::memset(buf, 0, n * sizeof(int64_t));
-  }
-  return torch::from_blob(buf, {n}, torch::kInt64);
 }

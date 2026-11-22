@@ -398,6 +398,4 @@ void direct_dcp_a2a_lse_reduce(
     int64_t max_num_tokens,
     bool is_lse_base_on_e);
 
-at::Tensor direct_dcp_a2a_trace(bool reset);
-
 std::tuple<int64_t, int64_t> getMemoryInfo(int64_t device_index);
