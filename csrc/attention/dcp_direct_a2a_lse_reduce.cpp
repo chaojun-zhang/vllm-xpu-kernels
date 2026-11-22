@@ -231,90 +231,117 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
         signal_stride_(signal_stride) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
-    weights_ = sycl::local_accessor<float, 1>(world_size_, cgh);
+    weights_ =
+        sycl::local_accessor<float, 1>(world_size_ * heads_per_rank_, cgh);
+    timed_out_ = sycl::local_accessor<int32_t, 1>(1, cgh);
   }
 
+  // One work-group per token covers all of its heads: per-(token, head)
+  // groups made thousands of waiters hammer the same signal words.
   void operator()(sycl::nd_item<1> item) const {
     const int64_t tid = item.get_local_id(0);
     const int64_t block_size = item.get_local_range(0);
-    const int64_t work_item = item.get_group(0);
-    const int64_t token_idx = work_item / heads_per_rank_;
-    const int64_t head_idx = work_item - token_idx * heads_per_rank_;
+    const int64_t token_idx = item.get_group(0);
     const uint32_t epoch = static_cast<uint32_t>(epoch_ptr_[0]);
     const int64_t parity = static_cast<int64_t>(epoch & 1u);
     constexpr float inf = std::numeric_limits<float>::infinity();
 
     if (tid == 0) {
-      float lse_max = -inf;
-      bool timed_out = false;
+      int32_t timed_out = 0;
       for (int64_t src = 0; src < world_size_; ++src) {
-        const int64_t source_item =
-            ((parity * world_size_ + src) * max_num_tokens_ + token_idx) *
-                heads_per_rank_ +
-            head_idx;
         const uint32_t* signal =
             received_signal_ + (parity * world_size_ + src) * signal_stride_;
         if (!wait_for_epoch(signal, epoch)) {
           sycl::ext::oneapi::experimental::printf(
-              "direct DCP A2A timeout source=%ld token=%ld head=%ld epoch=%u\n",
+              "direct DCP A2A timeout source=%ld token=%ld epoch=%u\n",
               static_cast<long>(src),
               static_cast<long>(token_idx),
-              static_cast<long>(head_idx),
               epoch);
-          timed_out = true;
+          timed_out = 1;
           break;
         }
-        float value = received_lse_[source_item];
+      }
+      timed_out_[0] = timed_out;
+    }
+    sycl::group_barrier(item.get_group());
+    // Only tid 0 acquired the signals; make peer data visible to every thread.
+    sycl::atomic_fence(
+        sycl::memory_order::acquire, sycl::memory_scope::system);
+    const bool timed_out = timed_out_[0] != 0;
+
+    for (int64_t head = tid; head < heads_per_rank_; head += block_size) {
+      float* weights = &weights_[head * world_size_];
+      if (timed_out) {
+        // Surface the failure as NaNs instead of hanging the device.
+        for (int64_t src = 0; src < world_size_; ++src) {
+          weights[src] = std::numeric_limits<float>::quiet_NaN();
+        }
+        continue;
+      }
+      float lse_max = -inf;
+      for (int64_t src = 0; src < world_size_; ++src) {
+        float value = received_lse_
+            [((parity * world_size_ + src) * max_num_tokens_ + token_idx) *
+                 heads_per_rank_ +
+             head];
         if (sycl::isnan(value) || value == inf) {
           value = -inf;
         }
         if (is_lse_base_on_e_) {
           value *= kLog2E;
         }
-        weights_[src] = value;
+        weights[src] = value;
         lse_max = sycl::fmax(lse_max, value);
       }
-      if (timed_out) {
-        // Surface the failure as NaNs instead of hanging the device.
-        for (int64_t src = 0; src < world_size_; ++src) {
-          weights_[src] = std::numeric_limits<float>::quiet_NaN();
-        }
-      } else {
-        if (lse_max == -inf) {
-          lse_max = 0.0f;
-        }
-        float lse_sum = 0.0f;
-        for (int64_t src = 0; src < world_size_; ++src) {
-          lse_sum += sycl::exp2(weights_[src] - lse_max);
-        }
-        const float inverse_lse_sum = lse_sum > 0.0f ? 1.0f / lse_sum : 0.0f;
-        for (int64_t src = 0; src < world_size_; ++src) {
-          weights_[src] = sycl::exp2(weights_[src] - lse_max) * inverse_lse_sum;
-        }
+      if (lse_max == -inf) {
+        lse_max = 0.0f;
+      }
+      float lse_sum = 0.0f;
+      for (int64_t src = 0; src < world_size_; ++src) {
+        lse_sum += sycl::exp2(weights[src] - lse_max);
+      }
+      const float inverse_lse_sum = lse_sum > 0.0f ? 1.0f / lse_sum : 0.0f;
+      for (int64_t src = 0; src < world_size_; ++src) {
+        weights[src] = sycl::exp2(weights[src] - lse_max) * inverse_lse_sum;
       }
     }
     sycl::group_barrier(item.get_group());
-    // Only tid 0 acquired the signal; make peer data visible to every thread.
-    sycl::atomic_fence(
-        sycl::memory_order::acquire, sycl::memory_scope::system);
 
-    for (int64_t d = tid; d < head_dim_; d += block_size) {
-      float accumulator = 0.0f;
+    // head_dim % 8 == 0, so each 16-byte vector stays within one head.
+    constexpr int64_t kVec = sizeof(sycl::uint4) / sizeof(scalar_t);
+    const int64_t vectors_per_head = head_dim_ / kVec;
+    const int64_t vectors_per_token = heads_per_rank_ * vectors_per_head;
+    const auto* received =
+        reinterpret_cast<const sycl::uint4*>(received_output_);
+    auto* combined = reinterpret_cast<sycl::uint4*>(combined_output_);
+    for (int64_t v = tid; v < vectors_per_token; v += block_size) {
+      const int64_t head = v / vectors_per_head;
+      const float* weights = &weights_[head * world_size_];
+      float accumulator[kVec] = {};
       for (int64_t src = 0; src < world_size_; ++src) {
-        const float weight = weights_[src];
+        const float weight = weights[src];
+        // Empty-KV peers skip their output write, so never read it.
         if (weight == 0.0f) {
           continue;
         }
-        const int64_t source_item =
+        const int64_t source_vector =
             ((parity * world_size_ + src) * max_num_tokens_ + token_idx) *
-                heads_per_rank_ +
-            head_idx;
-        accumulator +=
-            static_cast<float>(received_output_[source_item * head_dim_ + d]) *
-            weight;
+                vectors_per_token +
+            v;
+        const sycl::uint4 packed = received[source_vector];
+        const auto* values = reinterpret_cast<const scalar_t*>(&packed);
+#pragma unroll
+        for (int64_t i = 0; i < kVec; ++i) {
+          accumulator[i] += static_cast<float>(values[i]) * weight;
+        }
       }
-      combined_output_[work_item * head_dim_ + d] =
-          static_cast<scalar_t>(accumulator);
+      sycl::uint4 packed;
+      auto* values = reinterpret_cast<scalar_t*>(&packed);
+#pragma unroll
+      for (int64_t i = 0; i < kVec; ++i) {
+        values[i] = static_cast<scalar_t>(accumulator[i]);
+      }
+      combined[token_idx * vectors_per_token + v] = packed;
     }
   }
 
@@ -328,6 +355,7 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
   bool is_lse_base_on_e_;
   int64_t signal_stride_;
   sycl::local_accessor<float, 1> weights_;
+  sycl::local_accessor<int32_t, 1> timed_out_;
 };
 
 inline const uint64_t* ptr_table(const torch::Tensor& t, const char* name) {
@@ -488,7 +516,7 @@ void direct_dcp_a2a_lse_reduce(
 
   auto& queue = vllm::xpu::vllmGetQueue();
   constexpr int64_t kExchangeThreads = 256;
-  constexpr int64_t kCombineThreads = 128;
+  constexpr int64_t kCombineThreads = 256;
   int64_t* epoch_ptr = epoch.data_ptr<int64_t>();
 
   vllm::xpu::sycl_kernel_submit(queue, 1, 1, IncrementEpoch{epoch_ptr});
@@ -538,7 +566,7 @@ void direct_dcp_a2a_lse_reduce(
     using scalar_t = decltype(scalar_tag);
     vllm::xpu::sycl_kernel_submit(
         queue,
-        num_tokens * heads_per_rank * kCombineThreads,
+        num_tokens * kCombineThreads,
         kCombineThreads,
         WaitLseCombine<scalar_t>(
             reinterpret_cast<const scalar_t*>(received_output.data_ptr()),
