@@ -73,11 +73,6 @@ inline int64_t find_sequence(
   return left - 1;
 }
 
-struct IncrementEpoch {
-  int64_t* epoch;
-  void operator()(sycl::nd_item<1>) const { epoch[0] += 1; }
-};
-
 template <typename lse_t>
 class DispatchOutputLse : public xpu::SyclKernelConfigConvention {
  public:
@@ -88,7 +83,9 @@ class DispatchOutputLse : public xpu::SyclKernelConfigConvention {
       const int32_t* query_start_loc,
       const uint64_t* peer_output_ptrs,
       const uint64_t* peer_lse_ptrs,
-      const int64_t* epoch_ptr,
+      const uint64_t* peer_signal_ptrs,
+      uint32_t* done_counter,
+      int64_t* epoch_ptr,
       int64_t world_size,
       int64_t rank,
       int64_t num_tokens,
@@ -98,13 +95,16 @@ class DispatchOutputLse : public xpu::SyclKernelConfigConvention {
       int64_t head_dim,
       int64_t output_token_stride,
       int64_t lse_token_stride,
-      int64_t lse_head_stride)
+      int64_t lse_head_stride,
+      int64_t signal_stride)
       : partial_output_(partial_output),
         partial_lse_(partial_lse),
         seq_lens_(seq_lens),
         query_start_loc_(query_start_loc),
         peer_output_ptrs_(peer_output_ptrs),
         peer_lse_ptrs_(peer_lse_ptrs),
+        peer_signal_ptrs_(peer_signal_ptrs),
+        done_counter_(done_counter),
         epoch_ptr_(epoch_ptr),
         world_size_(world_size),
         rank_(rank),
@@ -115,16 +115,56 @@ class DispatchOutputLse : public xpu::SyclKernelConfigConvention {
         head_dim_(head_dim),
         output_token_stride_(output_token_stride),
         lse_token_stride_(lse_token_stride),
-        lse_head_stride_(lse_head_stride) {}
+        lse_head_stride_(lse_head_stride),
+        signal_stride_(signal_stride) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
     empty_kv_ = sycl::local_accessor<int32_t, 1>(1, cgh);
   }
 
+  // The epoch bump and peer signalling are folded into the last work-group to
+  // finish, saving two kernel launches per call.
   void operator()(sycl::nd_item<1> item) const {
     const int64_t tid = item.get_local_id(0);
+    const uint32_t epoch = static_cast<uint32_t>(epoch_ptr_[0]) + 1u;
+    const int64_t total_items = world_size_ * num_tokens_;
+    for (int64_t work_item = item.get_group(0); work_item < total_items;
+         work_item += item.get_group_range(0)) {
+      dispatch_item(item, work_item, epoch);
+    }
+
+    // Every thread flushes its peer stores before the group is counted done.
+    sycl::atomic_fence(
+        sycl::memory_order::release, sycl::memory_scope::system);
+    sycl::group_barrier(item.get_group());
+    if (tid != 0) {
+      return;
+    }
+    signal_ref_t counter(*done_counter_);
+    const uint32_t finished =
+        counter.fetch_add(
+            1u, sycl::memory_order::acq_rel, sycl::memory_scope::system) +
+        1u;
+    if (finished != item.get_group_range(0)) {
+      return;
+    }
+    counter.store(0u, sycl::memory_order::relaxed, sycl::memory_scope::system);
+    epoch_ptr_[0] = static_cast<int64_t>(epoch);
+    const int64_t parity = static_cast<int64_t>(epoch & 1u);
+    for (int64_t step = 0; step < world_size_; ++step) {
+      const int64_t destination_rank = (rank_ + 1 + step) % world_size_;
+      auto* peer_signal =
+          get_peer_ptr<uint32_t>(peer_signal_ptrs_, destination_rank);
+      store_release_system(
+          peer_signal + (parity * world_size_ + rank_) * signal_stride_, epoch);
+    }
+  }
+
+ private:
+  void dispatch_item(
+      sycl::nd_item<1> item, int64_t work_item, uint32_t epoch) const {
+    const int64_t tid = item.get_local_id(0);
     const int64_t block_size = item.get_local_range(0);
-    const int64_t work_item = item.get_group(0);
     // Work-groups roughly start in id order; rotate destinations per rank so
     // peers do not all write the same device at once (PCIe incast).
     const int64_t step = work_item / num_tokens_;
@@ -142,8 +182,9 @@ class DispatchOutputLse : public xpu::SyclKernelConfigConvention {
     }
     sycl::group_barrier(item.get_group());
     const bool empty_kv = empty_kv_[0] != 0;
+    // empty_kv_ is rewritten by the next item.
+    sycl::group_barrier(item.get_group());
 
-    const uint32_t epoch = static_cast<uint32_t>(epoch_ptr_[0]);
     const int64_t parity = static_cast<int64_t>(epoch & 1u);
     const int64_t destination_item =
         ((parity * world_size_ + rank_) * max_num_tokens_ + token_idx) *
@@ -173,38 +214,20 @@ class DispatchOutputLse : public xpu::SyclKernelConfigConvention {
     }
   }
 
- private:
   const sycl::uint4* partial_output_;
   const lse_t* partial_lse_;
   const int32_t* seq_lens_;
   const int32_t* query_start_loc_;
   const uint64_t* peer_output_ptrs_;
   const uint64_t* peer_lse_ptrs_;
-  const int64_t* epoch_ptr_;
+  const uint64_t* peer_signal_ptrs_;
+  uint32_t* done_counter_;
+  int64_t* epoch_ptr_;
   int64_t world_size_, rank_, num_tokens_, max_num_tokens_, num_seqs_;
   int64_t heads_per_rank_, head_dim_;
   int64_t output_token_stride_, lse_token_stride_, lse_head_stride_;
+  int64_t signal_stride_;
   sycl::local_accessor<int32_t, 1> empty_kv_;
-};
-
-struct SignalPeers {
-  const uint64_t* peer_signal_ptrs;
-  const int64_t* epoch_ptr;
-  int64_t world_size;
-  int64_t rank;
-  int64_t signal_stride;
-
-  void operator()(sycl::nd_item<1> item) const {
-    const int64_t destination_rank = item.get_global_id(0);
-    if (destination_rank >= world_size) {
-      return;
-    }
-    const uint32_t epoch = static_cast<uint32_t>(epoch_ptr[0]);
-    const int64_t parity = static_cast<int64_t>(epoch & 1u);
-    auto* peer_signal = get_peer_ptr<uint32_t>(peer_signal_ptrs, destination_rank);
-    store_release_system(
-        peer_signal + (parity * world_size + rank) * signal_stride, epoch);
-  }
 };
 
 template <typename scalar_t>
@@ -537,15 +560,22 @@ void direct_dcp_a2a_lse_reduce(
   constexpr int64_t kExchangeThreads = 256;
   constexpr int64_t kCombineThreads = 256;
   constexpr int64_t kCombineTargetGroups = 128;
+  // Caps work-groups contending on the dispatch completion counter.
+  constexpr int64_t kDispatchMaxGroups = 256;
   int64_t* epoch_ptr = epoch.data_ptr<int64_t>();
-
-  vllm::xpu::sycl_kernel_submit(queue, 1, 1, IncrementEpoch{epoch_ptr});
+  // This rank's own signal line is written only locally, so its padding
+  // holds the dispatch completion counter (zero between calls).
+  uint32_t* done_counter =
+      reinterpret_cast<uint32_t*>(received_signal.data_ptr<int32_t>()) +
+      rank * signal_stride + signal_stride - 1;
+  const int64_t dispatch_groups =
+      std::min(world_size * num_tokens, kDispatchMaxGroups);
 
   auto launch_dispatch = [&](auto lse_tag) {
     using lse_t = decltype(lse_tag);
     vllm::xpu::sycl_kernel_submit(
         queue,
-        world_size * num_tokens * kExchangeThreads,
+        dispatch_groups * kExchangeThreads,
         kExchangeThreads,
         DispatchOutputLse<lse_t>(
             reinterpret_cast<const sycl::uint4*>(partial_output.data_ptr()),
@@ -554,6 +584,8 @@ void direct_dcp_a2a_lse_reduce(
             query_start_loc_ptr,
             output_ptrs,
             lse_ptrs,
+            signal_ptrs,
+            done_counter,
             epoch_ptr,
             world_size,
             rank,
@@ -564,7 +596,8 @@ void direct_dcp_a2a_lse_reduce(
             head_dim,
             output_token_stride,
             lse_token_stride,
-            lse_head_stride));
+            lse_head_stride,
+            signal_stride));
   };
   if (lse_dtype == at::kFloat) {
     launch_dispatch(float{});
@@ -573,14 +606,6 @@ void direct_dcp_a2a_lse_reduce(
   } else {
     launch_dispatch(sycl::half{});
   }
-
-  const int64_t signal_groups =
-      (world_size + kExchangeThreads - 1) / kExchangeThreads;
-  vllm::xpu::sycl_kernel_submit(
-      queue,
-      signal_groups * kExchangeThreads,
-      kExchangeThreads,
-      SignalPeers{signal_ptrs, epoch_ptr, world_size, rank, signal_stride});
 
   // Split each token's heads across groups only while the grid stays near
   // kCombineTargetGroups, keeping small batches parallel without flooding
