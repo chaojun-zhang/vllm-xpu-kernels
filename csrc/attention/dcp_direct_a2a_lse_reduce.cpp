@@ -190,27 +190,6 @@ class DispatchOutputLse : public xpu::SyclKernelConfigConvention {
   sycl::local_accessor<int32_t, 1> empty_kv_;
 };
 
-struct SignalPeers {
-  const uint64_t* peer_signal_ptrs;
-  const int64_t* epoch_ptr;
-  int64_t world_size;
-  int64_t rank;
-  int64_t signal_stride;
-
-  void operator()(sycl::nd_item<1> item) const {
-    const int64_t destination_rank = item.get_global_id(0);
-    if (destination_rank >= world_size) {
-      return;
-    }
-    const uint32_t epoch = static_cast<uint32_t>(epoch_ptr[0]);
-    const int64_t parity = static_cast<int64_t>(epoch & 1u);
-    auto* peer_signal =
-        get_peer_ptr<uint32_t>(peer_signal_ptrs, destination_rank);
-    store_release_system(
-        peer_signal + (parity * world_size + rank) * signal_stride, epoch);
-  }
-};
-
 template <typename scalar_t>
 class WaitLseCombine : public xpu::SyclKernelConfigConvention {
  public:
@@ -218,9 +197,11 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
       const scalar_t* received_output,
       const float* received_lse,
       const uint32_t* received_signal,
+      const uint64_t* peer_signal_ptrs,
       const int64_t* epoch_ptr,
       scalar_t* combined_output,
       int64_t world_size,
+      int64_t rank,
       int64_t max_num_tokens,
       int64_t heads_per_rank,
       int64_t head_dim,
@@ -230,9 +211,11 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
       : received_output_(received_output),
         received_lse_(received_lse),
         received_signal_(received_signal),
+        peer_signal_ptrs_(peer_signal_ptrs),
         epoch_ptr_(epoch_ptr),
         combined_output_(combined_output),
         world_size_(world_size),
+        rank_(rank),
         max_num_tokens_(max_num_tokens),
         heads_per_rank_(heads_per_rank),
         head_dim_(head_dim),
@@ -261,6 +244,17 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
     const uint32_t epoch = static_cast<uint32_t>(epoch_ptr_[0]);
     const int64_t parity = static_cast<int64_t>(epoch & 1u);
     constexpr float inf = std::numeric_limits<float>::infinity();
+
+    // The dispatch kernel has completed (in-order queue), so publish this
+    // rank's signal to every peer from the first lanes of the grid.
+    const int64_t grid_threads = item.get_group_range(0) * block_size;
+    for (int64_t dst = item.get_group(0) * block_size + tid; dst < world_size_;
+         dst += grid_threads) {
+      store_release_system(
+          get_peer_ptr<uint32_t>(peer_signal_ptrs_, dst) +
+              (parity * world_size_ + rank_) * signal_stride_,
+          epoch);
+    }
 
     // One lane per source rank polls its signal; the host guarantees
     // block_size >= world_size.
@@ -372,9 +366,10 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
   const scalar_t* received_output_;
   const float* received_lse_;
   const uint32_t* received_signal_;
+  const uint64_t* peer_signal_ptrs_;
   const int64_t* epoch_ptr_;
   scalar_t* combined_output_;
-  int64_t world_size_, max_num_tokens_, heads_per_rank_, head_dim_;
+  int64_t world_size_, rank_, max_num_tokens_, heads_per_rank_, head_dim_;
   bool is_lse_base_on_e_;
   int64_t signal_stride_;
   int64_t heads_per_group_;
@@ -594,14 +589,6 @@ void direct_dcp_a2a_lse_reduce(
     launch_dispatch(sycl::half{});
   }
 
-  const int64_t signal_groups =
-      (world_size + kExchangeThreads - 1) / kExchangeThreads;
-  vllm::xpu::sycl_kernel_submit(
-      queue,
-      signal_groups * kExchangeThreads,
-      kExchangeThreads,
-      SignalPeers{signal_ptrs, epoch_ptr, world_size, rank, signal_stride});
-
   // Split each token's heads across groups only while the grid stays near
   // kCombineTargetGroups, keeping small batches parallel without flooding
   // the signal words with waiters.
@@ -630,9 +617,11 @@ void direct_dcp_a2a_lse_reduce(
             received_lse.const_data_ptr<float>(),
             reinterpret_cast<const uint32_t*>(
                 received_signal.const_data_ptr<int32_t>()),
+            signal_ptrs,
             epoch_ptr,
             reinterpret_cast<scalar_t*>(combined_output.data_ptr()),
             world_size,
+            rank,
             max_num_tokens,
             heads_per_rank,
             head_dim,
