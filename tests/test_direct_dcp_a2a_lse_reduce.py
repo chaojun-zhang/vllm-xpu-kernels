@@ -352,3 +352,27 @@ def test_direct_dcp_a2a_lse_reduce_rejects_line_sharing_layout(
             torch.zeros(1, dtype=torch.int64, device=device),
             partial_output.new_empty(1, HEADS_PER_RANK, HEAD_DIM),
             world_size, 0, max_num_tokens, False)
+
+
+def test_direct_dcp_a2a_lse_reduce_rejects_small_staging():
+    """Staging buffers smaller than the declared capacity must be refused."""
+    world_size, device = 2, torch.device("xpu", 0)
+    total_heads = world_size * HEADS_PER_RANK
+    partial_output = torch.zeros(1, total_heads, HEAD_DIM,
+                                 dtype=torch.bfloat16, device=device)
+    partial_lse = torch.zeros(1, total_heads, device=device)
+    ptrs = torch.zeros(world_size, dtype=torch.uint64, device=device)
+    received_output = torch.zeros(2, world_size, MAX_NUM_TOKENS // 2,
+                                  HEADS_PER_RANK, HEAD_DIM,
+                                  dtype=torch.bfloat16, device=device)
+    received_lse = torch.zeros(2, world_size, MAX_NUM_TOKENS,
+                               HEADS_PER_RANK, device=device)
+    received_signal = torch.zeros(2, world_size, SIGNAL_STRIDE,
+                                  dtype=torch.int32, device=device)
+    with pytest.raises(RuntimeError, match="too small"):
+        torch.ops._C.direct_dcp_a2a_lse_reduce(
+            partial_output, partial_lse, None, None, ptrs, ptrs, ptrs,
+            received_output, received_lse, received_signal,
+            torch.zeros(1, dtype=torch.int64, device=device),
+            partial_output.new_empty(1, HEADS_PER_RANK, HEAD_DIM),
+            world_size, 0, MAX_NUM_TOKENS, False)
