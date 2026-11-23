@@ -42,15 +42,18 @@ inline void store_release_system(uint32_t* ptr, uint32_t value) {
   ref.store(value, sycl::memory_order::release, sycl::memory_scope::system);
 }
 
-inline uint32_t load_acquire_system(const uint32_t* ptr) {
+inline uint32_t load_relaxed_system(const uint32_t* ptr) {
   signal_ref_t ref(*const_cast<uint32_t*>(ptr));
-  return ref.load(sycl::memory_order::acquire, sycl::memory_scope::system);
+  return ref.load(sycl::memory_order::relaxed, sycl::memory_scope::system);
 }
 
 inline bool wait_for_epoch(const uint32_t* ptr, uint32_t epoch) {
   for (uint64_t spins = 0; spins < kSpinLimit; ++spins) {
     // Wrap-safe >=: a peer that already moved on must not strand the waiter.
-    if (static_cast<int32_t>(load_acquire_system(ptr) - epoch) >= 0) {
+    if (static_cast<int32_t>(load_relaxed_system(ptr) - epoch) >= 0) {
+      // Poll relaxed and fence once instead of an acquire load per spin.
+      sycl::atomic_fence(
+          sycl::memory_order::acquire, sycl::memory_scope::system);
       return true;
     }
   }
@@ -240,7 +243,7 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
   void sycl_ker_config_convention(sycl::handler& cgh) {
     weights_ =
         sycl::local_accessor<float, 1>(world_size_ * heads_per_group_, cgh);
-    timed_out_ = sycl::local_accessor<int32_t, 1>(1, cgh);
+    timed_out_ = sycl::local_accessor<int32_t, 1>(world_size_, cgh);
   }
 
   // Each work-group covers heads_per_group heads of one token, sized so the
@@ -259,27 +262,29 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
     const int64_t parity = static_cast<int64_t>(epoch & 1u);
     constexpr float inf = std::numeric_limits<float>::infinity();
 
-    if (tid == 0) {
-      int32_t timed_out = 0;
-      for (int64_t src = 0; src < world_size_; ++src) {
-        const uint32_t* signal =
-            received_signal_ + (parity * world_size_ + src) * signal_stride_;
-        if (!wait_for_epoch(signal, epoch)) {
-          sycl::ext::oneapi::experimental::printf(
-              "direct DCP A2A timeout source=%ld token=%ld epoch=%u\n",
-              static_cast<long>(src),
-              static_cast<long>(token_idx),
-              epoch);
-          timed_out = 1;
-          break;
-        }
+    // One lane per source rank polls its signal; the host guarantees
+    // block_size >= world_size.
+    if (tid < world_size_) {
+      const uint32_t* signal =
+          received_signal_ + (parity * world_size_ + tid) * signal_stride_;
+      const bool arrived = wait_for_epoch(signal, epoch);
+      if (!arrived) {
+        sycl::ext::oneapi::experimental::printf(
+            "direct DCP A2A timeout source=%ld token=%ld epoch=%u\n",
+            static_cast<long>(tid),
+            static_cast<long>(token_idx),
+            epoch);
       }
-      timed_out_[0] = timed_out;
+      timed_out_[tid] = arrived ? 0 : 1;
     }
     sycl::group_barrier(item.get_group());
-    // Only tid 0 acquired the signals; make peer data visible to every thread.
+    // Each polling lane acquired only its own signal; make peer data visible
+    // to every thread.
     sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
-    const bool timed_out = timed_out_[0] != 0;
+    bool timed_out = false;
+    for (int64_t src = 0; src < world_size_; ++src) {
+      timed_out |= timed_out_[src] != 0;
+    }
 
     for (int64_t local_head = tid; local_head < head_count;
          local_head += block_size) {
