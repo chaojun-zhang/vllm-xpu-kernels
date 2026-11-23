@@ -382,12 +382,14 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
   sycl::local_accessor<int32_t, 1> timed_out_;
 };
 
-inline const uint64_t* ptr_table(const torch::Tensor& t, const char* name) {
+inline const uint64_t*
+ptr_table(const torch::Tensor& t, const char* name, int64_t world_size) {
   TORCH_CHECK(
       (t.scalar_type() == at::kLong || t.scalar_type() == at::kUInt64) &&
           t.is_contiguous() && t.device().is_xpu(),
       name,
       " must be a contiguous int64/uint64 XPU tensor");
+  TORCH_CHECK(t.numel() >= world_size, name, " must hold one pointer per rank");
   return reinterpret_cast<const uint64_t*>(t.data_ptr());
 }
 
@@ -428,7 +430,8 @@ void direct_dcp_a2a_lse_reduce(
   TORCH_CHECK(
       partial_output.dim() == 3 && partial_lse.dim() == 2,
       "expected output [T,H,D] and LSE [T,H]");
-  TORCH_CHECK(world_size > 1, "world_size must be greater than 1");
+  TORCH_CHECK(
+      world_size > 1 && world_size <= 256, "world_size must be in [2, 256]");
   TORCH_CHECK(rank >= 0 && rank < world_size, "invalid rank");
 
   const int64_t num_tokens = partial_output.size(0);
@@ -468,6 +471,17 @@ void direct_dcp_a2a_lse_reduce(
           received_lse.scalar_type() == at::kFloat &&
           received_signal.scalar_type() == at::kInt,
       "invalid symmetric staging dtypes");
+  const int64_t staged_items = 2 * world_size * max_num_tokens * heads_per_rank;
+  TORCH_CHECK(
+      received_output.is_xpu() && received_lse.is_xpu() &&
+          received_signal.is_xpu() && received_output.is_contiguous() &&
+          received_lse.is_contiguous() && received_signal.is_contiguous(),
+      "symmetric staging buffers must be contiguous XPU tensors");
+  TORCH_CHECK(
+      received_lse.numel() >= staged_items &&
+          received_output.numel() >= staged_items * head_dim,
+      "symmetric staging buffers are too small for world_size, ",
+      "max_num_tokens and the head layout");
   // Signal slots are strided so each one owns a cache line; the stride is
   // inferred from the buffer size to keep the op schema unchanged.
   const int64_t signal_slots = 2 * world_size;
@@ -532,13 +546,16 @@ void direct_dcp_a2a_lse_reduce(
     query_start_loc_ptr = query_start_loc->const_data_ptr<int32_t>();
   }
 
-  const uint64_t* output_ptrs = ptr_table(peer_output_ptrs, "peer_output_ptrs");
-  const uint64_t* lse_ptrs = ptr_table(peer_lse_ptrs, "peer_lse_ptrs");
-  const uint64_t* signal_ptrs = ptr_table(peer_signal_ptrs, "peer_signal_ptrs");
+  const uint64_t* output_ptrs =
+      ptr_table(peer_output_ptrs, "peer_output_ptrs", world_size);
+  const uint64_t* lse_ptrs =
+      ptr_table(peer_lse_ptrs, "peer_lse_ptrs", world_size);
+  const uint64_t* signal_ptrs =
+      ptr_table(peer_signal_ptrs, "peer_signal_ptrs", world_size);
 
   auto& queue = vllm::xpu::vllmGetQueue();
   constexpr int64_t kExchangeThreads = 256;
-  constexpr int64_t kCombineThreads = 256;
+  constexpr int64_t kMaxCombineThreads = 256;
   constexpr int64_t kCombineTargetGroups = 128;
   int64_t* epoch_ptr = epoch.data_ptr<int64_t>();
 
@@ -596,12 +613,18 @@ void direct_dcp_a2a_lse_reduce(
               kCombineTargetGroups));
   const int64_t combine_groups =
       num_tokens * ((heads_per_rank + heads_per_group - 1) / heads_per_group);
+  // One 16-byte vector per thread, rounded to a subgroup multiple; at least
+  // one lane per source rank for the parallel signal wait.
+  const int64_t combine_vectors = heads_per_group * head_dim / 8;
+  const int64_t combine_threads = std::min<int64_t>(
+      kMaxCombineThreads,
+      (std::max<int64_t>(combine_vectors, world_size) + 31) / 32 * 32);
   auto launch_combine = [&](auto scalar_tag) {
     using scalar_t = decltype(scalar_tag);
     vllm::xpu::sycl_kernel_submit(
         queue,
-        combine_groups * kCombineThreads,
-        kCombineThreads,
+        combine_groups * combine_threads,
+        combine_threads,
         WaitLseCombine<scalar_t>(
             reinterpret_cast<const scalar_t*>(received_output.data_ptr()),
             received_lse.const_data_ptr<float>(),
