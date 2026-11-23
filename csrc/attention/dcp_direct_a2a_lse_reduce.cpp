@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <sycl/sycl.hpp>
@@ -100,7 +101,10 @@ class DispatchOutputLse : public xpu::SyclKernelConfigConvention {
       int64_t head_dim,
       int64_t output_token_stride,
       int64_t lse_token_stride,
-      int64_t lse_head_stride)
+      int64_t lse_head_stride,
+      uint32_t* arrival,
+      const uint64_t* peer_signal_ptrs,
+      int64_t signal_stride)
       : partial_output_(partial_output),
         partial_lse_(partial_lse),
         seq_lens_(seq_lens),
@@ -117,7 +121,10 @@ class DispatchOutputLse : public xpu::SyclKernelConfigConvention {
         head_dim_(head_dim),
         output_token_stride_(output_token_stride),
         lse_token_stride_(lse_token_stride),
-        lse_head_stride_(lse_head_stride) {}
+        lse_head_stride_(lse_head_stride),
+        arrival_(arrival),
+        peer_signal_ptrs_(peer_signal_ptrs),
+        signal_stride_(signal_stride) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
     empty_kv_ = sycl::local_accessor<int32_t, 1>(1, cgh);
@@ -174,6 +181,35 @@ class DispatchOutputLse : public xpu::SyclKernelConfigConvention {
                    : static_cast<float>(
                          partial_lse_[source_lse + h * lse_head_stride_]);
     }
+
+    if (arrival_ == nullptr) {
+      return;
+    }
+    // The last group to finish publishes this rank's signal, so peers do not
+    // wait for the dispatch -> combine kernel boundary. The counter lives in
+    // the padding of this rank's own signal slot, which no peer writes.
+    sycl::group_barrier(item.get_group(), sycl::memory_scope::system);
+    if (tid == 0) {
+      sycl::atomic_fence(
+          sycl::memory_order::release, sycl::memory_scope::system);
+      sycl::atomic_ref<
+          uint32_t,
+          sycl::memory_order::acq_rel,
+          sycl::memory_scope::system,
+          sycl::access::address_space::global_space>
+          counter(
+              arrival_[(parity * world_size_ + rank_) * signal_stride_ + 1]);
+      const uint32_t total = static_cast<uint32_t>(world_size_ * num_tokens_);
+      if (counter.fetch_add(1u) == total - 1) {
+        counter.store(0u, sycl::memory_order::relaxed);
+        for (int64_t dst = 0; dst < world_size_; ++dst) {
+          store_release_system(
+              get_peer_ptr<uint32_t>(peer_signal_ptrs_, dst) +
+                  (parity * world_size_ + rank_) * signal_stride_,
+              epoch);
+        }
+      }
+    }
   }
 
  private:
@@ -187,6 +223,9 @@ class DispatchOutputLse : public xpu::SyclKernelConfigConvention {
   int64_t world_size_, rank_, num_tokens_, max_num_tokens_, num_seqs_;
   int64_t heads_per_rank_, head_dim_;
   int64_t output_token_stride_, lse_token_stride_, lse_head_stride_;
+  uint32_t* arrival_;
+  const uint64_t* peer_signal_ptrs_;
+  int64_t signal_stride_;
   sycl::local_accessor<int32_t, 1> empty_kv_;
 };
 
@@ -207,7 +246,8 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
       int64_t head_dim,
       bool is_lse_base_on_e,
       int64_t signal_stride,
-      int64_t heads_per_group)
+      int64_t heads_per_group,
+      bool publish_signal)
       : received_output_(received_output),
         received_lse_(received_lse),
         received_signal_(received_signal),
@@ -221,7 +261,8 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
         head_dim_(head_dim),
         is_lse_base_on_e_(is_lse_base_on_e),
         signal_stride_(signal_stride),
-        heads_per_group_(heads_per_group) {}
+        heads_per_group_(heads_per_group),
+        publish_signal_(publish_signal) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
     weights_ =
@@ -248,7 +289,8 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
     // The dispatch kernel has completed (in-order queue), so publish this
     // rank's signal to every peer from the first lanes of the grid.
     const int64_t grid_threads = item.get_group_range(0) * block_size;
-    for (int64_t dst = item.get_group(0) * block_size + tid; dst < world_size_;
+    for (int64_t dst = item.get_group(0) * block_size + tid;
+         publish_signal_ && dst < world_size_;
          dst += grid_threads) {
       store_release_system(
           get_peer_ptr<uint32_t>(peer_signal_ptrs_, dst) +
@@ -373,6 +415,7 @@ class WaitLseCombine : public xpu::SyclKernelConfigConvention {
   bool is_lse_base_on_e_;
   int64_t signal_stride_;
   int64_t heads_per_group_;
+  bool publish_signal_;
   sycl::local_accessor<float, 1> weights_;
   sycl::local_accessor<int32_t, 1> timed_out_;
 };
@@ -551,7 +594,15 @@ void direct_dcp_a2a_lse_reduce(
   auto& queue = vllm::xpu::vllmGetQueue();
   constexpr int64_t kExchangeThreads = 256;
   constexpr int64_t kMaxCombineThreads = 256;
-  constexpr int64_t kCombineTargetGroups = 128;
+  // Experiment knobs; not for merge.
+  static const int64_t kCombineTargetGroups = [] {
+    const char* v = std::getenv("DCP_A2A_TARGET_GROUPS");
+    return v != nullptr ? std::max<int64_t>(1, std::atoll(v)) : 128;
+  }();
+  static const bool kSignalInDispatch = [] {
+    const char* v = std::getenv("DCP_A2A_SIGNAL_IN_DISPATCH");
+    return v != nullptr && std::atoi(v) != 0;
+  }();
   int64_t* epoch_ptr = epoch.data_ptr<int64_t>();
 
   vllm::xpu::sycl_kernel_submit(queue, 1, 1, IncrementEpoch{epoch_ptr});
@@ -579,7 +630,12 @@ void direct_dcp_a2a_lse_reduce(
             head_dim,
             output_token_stride,
             lse_token_stride,
-            lse_head_stride));
+            lse_head_stride,
+            kSignalInDispatch ? reinterpret_cast<uint32_t*>(
+                                    received_signal.data_ptr<int32_t>())
+                              : nullptr,
+            signal_ptrs,
+            signal_stride));
   };
   if (lse_dtype == at::kFloat) {
     launch_dispatch(float{});
@@ -627,7 +683,8 @@ void direct_dcp_a2a_lse_reduce(
             head_dim,
             is_lse_base_on_e,
             signal_stride,
-            heads_per_group));
+            heads_per_group,
+            !kSignalInDispatch));
   };
   if (output_dtype == at::kBFloat16) {
     launch_combine(sycl::ext::oneapi::bfloat16{});
