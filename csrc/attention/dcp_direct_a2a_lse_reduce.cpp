@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <sycl/sycl.hpp>
@@ -534,7 +535,11 @@ void direct_dcp_a2a_lse_reduce(
   auto& queue = vllm::xpu::vllmGetQueue();
   constexpr int64_t kExchangeThreads = 256;
   constexpr int64_t kCombineThreads = 256;
-  constexpr int64_t kCombineTargetGroups = 128;
+  // Experiment knob; not for merge.
+  static const int64_t kCombineTargetGroups = [] {
+    const char* v = std::getenv("DCP_A2A_TARGET_GROUPS");
+    return v != nullptr ? std::max<int64_t>(1, std::atoll(v)) : 128;
+  }();
   int64_t* epoch_ptr = epoch.data_ptr<int64_t>();
 
   vllm::xpu::sycl_kernel_submit(queue, 1, 1, IncrementEpoch{epoch_ptr});
