@@ -551,7 +551,9 @@ void direct_dcp_a2a_lse_reduce(
   auto& queue = vllm::xpu::vllmGetQueue();
   constexpr int64_t kExchangeThreads = 256;
   constexpr int64_t kMaxCombineThreads = 256;
-  constexpr int64_t kCombineTargetGroups = 128;
+  // Every combine group polls the system-scope signal words; on B60 more
+  // than ~16 pollers slow signal delivery (8 tokens DCP2: 24 -> 16 us).
+  constexpr int64_t kCombineTargetGroups = 16;
   int64_t* epoch_ptr = epoch.data_ptr<int64_t>();
 
   vllm::xpu::sycl_kernel_submit(queue, 1, 1, IncrementEpoch{epoch_ptr});
@@ -590,8 +592,7 @@ void direct_dcp_a2a_lse_reduce(
   }
 
   // Split each token's heads across groups only while the grid stays near
-  // kCombineTargetGroups, keeping small batches parallel without flooding
-  // the signal words with waiters.
+  // kCombineTargetGroups.
   const int64_t heads_per_group = std::min(
       heads_per_rank,
       std::max<int64_t>(
